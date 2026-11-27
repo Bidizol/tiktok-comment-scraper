@@ -154,61 +154,61 @@ class TokenManager:
         return self._refresh_attempts >= self._max_refresh_attempts
 
     def _refresh_token(self) -> Optional[str]:
-        """Attempt to refresh the token with bounded retries.
+        """Acquire a token with a finite retry budget.
 
-        Returns the new token string, or None if exhausted.
-        Classifies the type of failure (auth, network, API).
-        Thread-safe: called with self._lock held.
-
-        No token values or prefixes are ever logged or recorded.
+        Permanent authentication failures stop immediately. Transient
+        acquisition failures use bounded exponential backoff. Token values
+        are never included in logs or exception messages.
         """
-        self._refresh_attempts += 1
-        attempt = self._refresh_attempts
+        last_error: Optional[Exception] = None
 
-        logger.debug("Token refresh attempt %d/%d for worker %s", attempt, self._max_refresh_attempts, self.worker_id)
-
-        if attempt > self._max_refresh_attempts:
-            logger.warning(
-                "Token refresh exhausted %d attempts for worker %s",
+        while self._refresh_attempts < self._max_refresh_attempts:
+            self._refresh_attempts += 1
+            attempt = self._refresh_attempts
+            logger.debug(
+                "Token refresh attempt %d/%d for worker %s",
+                attempt,
                 self._max_refresh_attempts,
                 self.worker_id,
             )
-            raise TokenExhaustedError(
-                f"Token refresh exhausted after {self._max_refresh_attempts} attempts"
-            )
 
-        try:
-            new_token = self._acquire_token()
-            if new_token:
-                self._token = new_token
-                self._token_issue_time = datetime.now(timezone.utc)
-                self._refresh_attempts = 0  # Reset on success
-                logger.info("Token refreshed successfully for worker %s", self.worker_id)
-                return new_token
-            else:
-                # Token acquisition returned None - likely auth/network issue
-                logger.warning("Token acquisition returned None for worker %s (attempt %d)", self.worker_id, attempt)
-                if attempt >= self._max_refresh_attempts:
-                    raise TokenExhaustedError(
-                        f"Token acquisition failed after {self._max_refresh_attempts} attempts"
-                    )
-                return None
+            try:
+                new_token = self._acquire_token()
+                if new_token:
+                    self._token = new_token
+                    self._token_issue_time = datetime.now(timezone.utc)
+                    self._refresh_attempts = 0
+                    logger.info("Token refreshed successfully for worker %s", self.worker_id)
+                    return new_token
+                last_error = TokenError("Token acquisition returned no token")
+            except TokenExhaustedError:
+                raise
+            except Exception as error:
+                last_error = error
+                outcome = getattr(error, "outcome", None)
+                permanent_values = (
+                    "failed_permanent",
+                    getattr(ErrorOutcome, "FAILED_PERMANENT", "failed_permanent"),
+                )
+                if outcome in permanent_values:
+                    raise
 
-        except TokenExhaustedError:
-            raise
-        except Exception as error:
-            # Classify the error without exposing token data
-            classification = self._classify_refresh_error(error, attempt)
-            raise ScraperError(
-                timestamp_utc=datetime.now(timezone.utc).isoformat(),
-                error_code=classification.error_code,
-                severity=classification.severity,
-                component="token_manager",
-                function="_refresh_token",
-                explanation=classification.explanation,
-                http_status=classification.http_status,
-                outcome=classification.default_outcome,
-            )
+            if self._refresh_attempts < self._max_refresh_attempts:
+                delay = min(2 ** (attempt - 1), 8)
+                logger.warning(
+                    "Token refresh failed for worker %s; retrying within bounded budget",
+                    self.worker_id,
+                )
+                time.sleep(delay)
+
+        logger.warning(
+            "Token refresh exhausted %d attempts for worker %s",
+            self._max_refresh_attempts,
+            self.worker_id,
+        )
+        raise TokenExhaustedError(
+            f"Token refresh exhausted after {self._max_refresh_attempts} attempts"
+        ) from last_error
 
     def _acquire_token(self) -> Optional[str]:
         """Acquire a fresh token from the TikTok API using centralized HTTP transport.
@@ -295,6 +295,8 @@ class TokenManager:
                     outcome=classification.default_outcome,
                 )
 
+        except ScraperError:
+            raise
         except Exception as error:
             # Classify without exposing token data
             classification = self._classify_refresh_error(error, 1)
