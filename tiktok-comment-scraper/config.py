@@ -132,11 +132,15 @@ for _runtime_directory in (OUTPUT_DIR, CACHE_DIR, ERROR_REPORT_DIR, DATABASE_PAT
 # Testing configuration
 TEST_MODE: bool = os.environ.get("TEST_MODE", "0") == "1"
 
-# Video configuration
-TEST_VIDEOS: list = [
-    (os.environ.get("TEST_VIDEO_ID", "7676572010415230221"),
-     os.environ.get("TEST_VIDEO_AUTHOR", "erickie20"))
-]
+# Video configuration. Never fall back to a baked-in example video.
+_configured_video_id = os.environ.get("TEST_VIDEO_ID", "").strip()
+_configured_video_author = os.environ.get("TEST_VIDEO_AUTHOR", "").strip()
+if bool(_configured_video_id) != bool(_configured_video_author):
+    raise ValueError("TEST_VIDEO_ID and TEST_VIDEO_AUTHOR must be configured together")
+TEST_VIDEOS: list = (
+    [(_configured_video_id, _configured_video_author)]
+    if _configured_video_id and _configured_video_author else []
+)
 
 # ---------------------------------------------------------------------------
 # Configuration validation

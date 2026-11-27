@@ -114,7 +114,7 @@ The supported scraper command is `python tiktokscraper-1.py` from this directory
 1. Install Python 3.10 or newer.
 2. Open this project directory.
 3. Copy `.env.example` to `.env`.
-4. Set `TEST_VIDEO_ID` and `TEST_VIDEO_AUTHOR` in `.env`.
+4. Set both `TEST_VIDEO_ID` and `TEST_VIDEO_AUTHOR` in `.env`. The scraper does not select a built-in example video.
 5. Run the scraper.
 
 macOS/Linux:
@@ -135,7 +135,7 @@ Copy-Item .env.example .env
 python tiktokscraper-1.py
 ```
 
-The virtual environment is optional because the active scraper currently has no third-party package dependencies. The `.env` file is local configuration and must not be committed.
+The virtual environment is optional because the active scraper currently has no third-party package dependencies. The `.env` file is local configuration and must not be committed. If either target-video value is missing, the command starts no collection run.
 
 ### Persistent storage locations
 
