@@ -310,6 +310,13 @@ class CommentPaginator:
                 PaginatorOutcome.INTERRUPTED, PaginationState.INTERRUPTED,
                 "user_interrupt",
             )
+        except Exception as error:
+            logger.exception("Unexpected pagination failure")
+            return self._finish(
+                PaginatorOutcome.FAILED, PaginationState.FAILED,
+                "unexpected_pagination_error",
+                self._error("UNEXPECTED_PAGINATION_ERROR", type(error).__name__),
+            )
 
     def _fetch_batch(self, *, cursor: int, mstoken: str) -> Dict[str, Any]:
         query = urlencode({
@@ -342,7 +349,9 @@ class CommentPaginator:
             "comments": data.get("comments"),
             "has_more": data.get("has_more"),
             "next_cursor": data.get("cursor"),
-            "error": data.get("status_msg") if data.get("status_code") not in (None, 0, "0") else None,
+            "error": (
+                data.get("status_msg") or f"API status_code={data.get('status_code')}"
+            ) if data.get("status_code") not in (None, 0, "0") else None,
         }
 
     def _error(
