@@ -263,9 +263,11 @@ class TokenManager:
                     outcome=classification.default_outcome,
                 )
 
-            # Response is a dict - check for msToken
+            # A token response may be cookie-only, so a missing/non-dict
+            # JSON body is acceptable until both cookie and JSON extraction
+            # have been attempted.
             if not isinstance(response, dict):
-                raise ValueError("Expected dict response from TikTok token endpoint")
+                response = {}
 
             # TikTok commonly issues msToken as a response cookie rather
             # than a JSON property. Prefer that cookie, with JSON fields as
