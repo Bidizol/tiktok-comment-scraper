@@ -200,6 +200,7 @@ class TokenManager:
             # Classify the error without exposing token data
             classification = self._classify_refresh_error(error, attempt)
             raise ScraperError(
+                timestamp_utc=datetime.now(timezone.utc).isoformat(),
                 error_code=classification.error_code,
                 severity=classification.severity,
                 component="token_manager",
@@ -252,6 +253,7 @@ class TokenManager:
                     self._refresh_attempts,
                 )
                 raise ScraperError(
+                    timestamp_utc=datetime.now(timezone.utc).isoformat(),
                     error_code=classification.error_code,
                     severity=classification.severity,
                     component="token_manager",
@@ -283,6 +285,7 @@ class TokenManager:
                     self._refresh_attempts,
                 )
                 raise ScraperError(
+                    timestamp_utc=datetime.now(timezone.utc).isoformat(),
                     error_code=classification.error_code,
                     severity=classification.severity,
                     component="token_manager",
@@ -296,6 +299,7 @@ class TokenManager:
             # Classify without exposing token data
             classification = self._classify_refresh_error(error, 1)
             raise ScraperError(
+                timestamp_utc=datetime.now(timezone.utc).isoformat(),
                 error_code=classification.error_code,
                 severity=classification.severity,
                 component="token_manager",
