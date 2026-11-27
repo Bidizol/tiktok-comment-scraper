@@ -454,12 +454,12 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
     safe_print(f" [W{worker_id}] {'─' * 55}")
 
     remaining_comments = max(0, MAX_COMMENTS - len(all_comments))
-    if remaining_comments > 0:
+    if remaining_comments > 0 and base_batch_number < DEFAULT_MAX_BATCHES:
         paginator = CommentPaginator(
             video_id=video_id,
             run_id=str(uuid.uuid4()),
             worker_id=worker_id,
-            max_batches=max(1, DEFAULT_MAX_BATCHES - base_batch_number),
+            max_batches=DEFAULT_MAX_BATCHES - base_batch_number,
             max_comments=remaining_comments,
             transport=transport,
         )
@@ -479,7 +479,11 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
         )
     else:
         naturally_completed = False
-        stop_reason = "max_comments_reached"
+        stop_reason = (
+            "max_comments_reached"
+            if remaining_comments <= 0
+            else "max_batches_reached"
+        )
         total_batches = base_batch_number
 
     # A partial/failed pagination result must never be saved as complete.
