@@ -109,20 +109,25 @@ MINIMUM_FREE_BYTES: int = int(os.environ.get("MINIMUM_FREE_BYTES", str(100 * 102
 DIAGNOSTICS_MAX_BYTES: int = int(os.environ.get("DIAGNOSTICS_MAX_BYTES", str(10 * 1024 * 1024)))
 DIAGNOSTICS_BACKUP_COUNT: int = int(os.environ.get("DIAGNOSTICS_BACKUP_COUNT", "5"))
 
-# Output configuration
-OUTPUT_DIR: Path = BASE_DIR / "results"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# Runtime storage locations. Relative paths resolve from this project directory;
+# absolute paths support persistent mounts and external data volumes.
+def _runtime_path(variable: str, default: str) -> Path:
+    configured = os.environ.get(variable, default).strip()
+    if not configured:
+        raise ValueError(f"{variable} cannot be empty")
+    candidate = Path(configured).expanduser()
+    if not candidate.is_absolute():
+        candidate = BASE_DIR / candidate
+    return candidate.resolve()
 
-# Cache configuration — transitioning from JSON cache to SQLite
-CACHE_DIR: Path = BASE_DIR / "cache"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Database configuration
-DATABASE_PATH: Path = BASE_DIR / "scraper.db"
+OUTPUT_DIR: Path = _runtime_path("OUTPUT_DIR", "results")
+CACHE_DIR: Path = _runtime_path("CACHE_DIR", "cache")
+DATABASE_PATH: Path = _runtime_path("DATABASE_PATH", "scraper.db")
+ERROR_REPORT_DIR: Path = _runtime_path("ERROR_REPORT_DIR", "error_reports")
 
-# Error reporting configuration
-ERROR_REPORT_DIR: Path = BASE_DIR / "error_reports"
-ERROR_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+for _runtime_directory in (OUTPUT_DIR, CACHE_DIR, ERROR_REPORT_DIR, DATABASE_PATH.parent):
+    _runtime_directory.mkdir(parents=True, exist_ok=True)
 
 # Testing configuration
 TEST_MODE: bool = os.environ.get("TEST_MODE", "0") == "1"
