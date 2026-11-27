@@ -3,30 +3,37 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple
+from enum import Enum
+from typing import Any, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 
 class PaginationState(Enum):
-    """Explicit pagination states that must be tracked and auditable."""
+    """Explicit, auditable states for a single pagination run."""
+    INITIAL = "INITIAL"
+    FETCHING = "FETCHING"
+    BATCH_PROCESSED = "BATCH_PROCESSED"
+    CONTINUING = "CONTINUING"
+    COMPLETE = "COMPLETE"
+    COMPLETE_SUSPECT = "COMPLETE_SUSPECT"
+    EMPTY_UNCONFIRMED = "EMPTY_UNCONFIRMED"
+    TRUNCATED_LIMIT = "TRUNCATED_LIMIT"
+    FAILED_RESUMABLE = "FAILED_RESUMABLE"
+    FAILED_PERMANENT = "FAILED_PERMANENT"
+    INTERRUPTED = "INTERRUPTED"
+    SCHEMA_CHANGED = "SCHEMA_CHANGED"
+    PAGINATION_STALLED = "PAGINATION_STALLED"
 
-    INITIAL = auto()
-    FETCHING = auto()
-    BATCH_PROCESSED = auto()
-    CONTINUING = auto()
-    COMPLETED = auto()
-    PARTIAL = auto()
-    STALLED = auto()
-    FAILED = auto()
-    INTERRUPTED = auto()
+    # Compatibility aliases for earlier callers.
+    COMPLETED = "COMPLETE"
+    PARTIAL = "TRUNCATED_LIMIT"
+    STALLED = "PAGINATION_STALLED"
+    FAILED = "FAILED_PERMANENT"
 
 
 @dataclass
 class PaginationMetadata:
-    """Metadata tracked for each pagination operation."""
-
     video_id: str
     run_id: str
     worker_id: Optional[int]
@@ -42,9 +49,11 @@ class PaginationMetadata:
     outcome: PaginationState = PaginationState.INITIAL
     stop_reason: Optional[str] = None
     consecutive_empty_batches: int = 0
+    records_received: int = 0
+    missing_comment_ids: int = 0
+    pages_without_new_comments: int = 0
 
     def to_dict(self) -> dict:
-        """Convert the metadata to a dictionary for serialization."""
         return {
             "video_id": self.video_id,
             "run_id": self.run_id,
@@ -52,144 +61,85 @@ class PaginationMetadata:
             "requested_cursor": self.requested_cursor,
             "returned_cursor": str(self.returned_cursor) if self.returned_cursor is not None else None,
             "batch_number": self.batch_number,
+            "records_received": self.records_received,
             "records_returned": self.records_returned,
             "valid_comments_extracted": self.valid_comments_extracted,
             "duplicate_comments": self.duplicate_comments,
+            "missing_comment_ids": self.missing_comment_ids,
             "malformed_rejected": self.malformed_rejected,
             "has_more": self.has_more,
             "timestamp": self.timestamp.isoformat(),
             "outcome": self.outcome.name,
             "stop_reason": self.stop_reason,
             "consecutive_empty_batches": self.consecutive_empty_batches,
+            "pages_without_new_comments": self.pages_without_new_comments,
         }
 
 
 def normalise_has_more(raw: Any) -> bool:
-    """
-    Normalize has_more value from API response.
-
-    Required behavior:
-    - True -> True
-    - False -> False
-    - 1 -> True
-    - 0 -> False
-    - "1" -> True
-    - "0" -> False
-    - Missing -> Malformed metadata error (caller must handle)
-    - None -> Malformed metadata error
-    - "" -> Malformed metadata error
-    - Unknown string -> Malformed metadata error
-    - Unsupported integer -> Malformed metadata error
-
-    Returns True/False for valid inputs.
-    Raises ValueError for malformed metadata.
-    """
+    """Accept only explicit boolean/0/1 representations from the API."""
     if raw is None:
         raise ValueError("has_more is None - malformed metadata")
     if isinstance(raw, bool):
         return raw
     if isinstance(raw, int):
-        if raw == 1:
-            return True
-        if raw == 0:
-            return False
+        if raw in (0, 1):
+            return bool(raw)
         raise ValueError(f"Unsupported integer has_more value: {raw}")
     if isinstance(raw, str):
-        if raw == "1":
-            return True
-        if raw == "0":
-            return False
+        if raw in ("0", "1"):
+            return raw == "1"
         if raw == "":
             raise ValueError("has_more is empty string - malformed metadata")
         raise ValueError(f"Unknown has_more string value: {raw!r}")
-    # For any other type, raise error
     raise ValueError(f"Malformed has_more type: {type(raw).__name__}")
 
 
-DEFAULT_MAX_BATCHES: int = 500
-DEFAULT_MAX_COMMENTS: int = 10_000
-DEFAULT_MAX_CONSECUTIVE_EMPTY: int = 3
-DEFAULT_STALLED_TIMEOUT_SECONDS: int = 300
-DEFAULT_ELAPSED_TIMEOUT_SECONDS: int = 600
-
-
 class CursorRegression(Enum):
-    """Enum representing cursor regression states."""
-    NONE = auto()
-    REGRESSED = auto()       # Cursor moved backwards (e.g., 100 -> 50)
-    NON_ADVANCING = auto()   # Cursor stayed the same (e.g., 100 -> 100)
-    INVALID_TYPE = auto()    # Cursor is not an integer
-    MISSING = auto()         # Cursor is None
+    NONE = "NONE"
+    REGRESSED = "REGRESSED"
+    NON_ADVANCING = "NON_ADVANCING"
+    INVALID_TYPE = "INVALID_TYPE"
+    MISSING = "MISSING"
+    CYCLE = "CYCLE"
 
 
 class CursorIntegrityChecker:
-    """Safeguards against cursor integrity issues.
+    """Detect missing, invalid, repeated, cyclic and regressing cursors."""
 
-    Detects:
-    - Cursor cycles (repeated same cursor)
-    - Cursor regression (backwards movement)
-    - Non-advancing cursors
-    - Invalid cursor types
-    """
-
-    def __init__(self, max_cycle_detections: int = 10, max_consecutive_empty: int = 3):
+    def __init__(self, max_cycle_detections: int = 5000, max_consecutive_empty: int = 3):
+        if isinstance(max_cycle_detections, bool) or max_cycle_detections < 1:
+            raise ValueError("max_cycle_detections must be positive")
+        if isinstance(max_consecutive_empty, bool) or max_consecutive_empty < 1:
+            raise ValueError("max_consecutive_empty must be positive")
         self.max_cycle_detections = max_cycle_detections
         self.max_consecutive_empty = max_consecutive_empty
         self.seen_cursors: List[int] = []
-        self.consecutive_empty_batches: int = 0
+        self.consecutive_empty_batches = 0
         self.previous_cursor: Optional[int] = None
 
     def check_cursor_advancement(self, new_cursor: Optional[int]) -> Tuple[bool, str]:
-        """Check if cursor is advancing properly.
-
-        Returns:
-            (can_continue, reason) tuple
-
-        Reason codes:
-            - "ok": cursor is advancing normally
-            - "cursor_regression": cursor moved backwards
-            - "cursor_not_advancing": cursor stayed the same
-            - "cursor_cycle_detected": cursor repeated too many times
-            - "missing_returned_cursor": cursor is None
-            - "invalid_cursor_type": cursor is not an integer
-        """
         if new_cursor is None:
             return False, "missing_returned_cursor"
-
-        # bool is an int subclass in Python, but is never a valid API cursor.
-        if isinstance(new_cursor, bool) or not isinstance(new_cursor, int):
-            return False, f"invalid_cursor_type:{type(new_cursor).__name__}"
-
-        # A cursor must be unique within one pagination run. Reusing any
-        # previously returned cursor creates a cycle and risks duplicate pages.
-        if new_cursor in self.seen_cursors:
-            return False, f"cursor_cycle_detected:{new_cursor}"
-
-        # Check for no advancement (same cursor) BEFORE regression check
+        if isinstance(new_cursor, bool) or not isinstance(new_cursor, int) or new_cursor < 0:
+            return False, "invalid_cursor_type_or_value"
         if new_cursor == self.previous_cursor:
-            self.consecutive_empty_batches += 1
-            if self.consecutive_empty_batches >= self.max_consecutive_empty:
-                return False, "cursor_not_advancing:repeated_same_cursor"
-        elif self.previous_cursor is not None and new_cursor < self.previous_cursor:
-            # Regression detected - cursor moved backwards
-            # But only if it's not the same value (handled above)
-            self.consecutive_empty_batches = 0  # Reset on any new cursor value
-            return False, "cursor_regression:backwards_movement"
-        else:
-            # Cursor advanced (new_cursor > previous_cursor) or first cursor
-            # Reset empty counter on any new forward movement
-            self.consecutive_empty_batches = 0
-
+            return False, "cursor_not_advancing"
+        if new_cursor in self.seen_cursors:
+            return False, "cursor_cycle_detected"
+        if self.previous_cursor is not None and new_cursor < self.previous_cursor:
+            return False, "cursor_regression"
         self.seen_cursors.append(new_cursor)
-        # Keep only recent cursors to avoid memory issues
-        if len(self.seen_cursors) > self.max_cycle_detections * 2:
-            self.seen_cursors = self.seen_cursors[-self.max_cycle_detections:]
-
+        # A pagination run is bounded to at most 500 batches by default.
+        # Keep a hard ceiling for callers that configure a larger page budget.
+        if len(self.seen_cursors) > self.max_cycle_detections:
+            return False, "cursor_history_limit_reached"
         self.previous_cursor = new_cursor
         return True, "ok"
 
-    def reset(self) -> None:
-        """Reset checker state for new pagination run."""
+    def reset(self, initial_cursor: Optional[int] = None) -> None:
         self.seen_cursors = []
         self.consecutive_empty_batches = 0
-        self.previous_cursor = None
+        self.previous_cursor = initial_cursor
+        if initial_cursor is not None:
+            self.seen_cursors.append(initial_cursor)
