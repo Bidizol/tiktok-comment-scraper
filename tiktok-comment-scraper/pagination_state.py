@@ -172,14 +172,14 @@ class CursorIntegrityChecker:
         if new_cursor is None:
             return False, "missing_returned_cursor"
 
-        if not isinstance(new_cursor, int):
+        # bool is an int subclass in Python, but is never a valid API cursor.
+        if isinstance(new_cursor, bool) or not isinstance(new_cursor, int):
             return False, f"invalid_cursor_type:{type(new_cursor).__name__}"
 
-        # Check for cursor cycle
+        # A cursor must be unique within one pagination run. Reusing any
+        # previously returned cursor creates a cycle and risks duplicate pages.
         if new_cursor in self.seen_cursors:
-            cycle_count = self.seen_cursors.count(new_cursor)
-            if cycle_count >= self.max_cycle_detections:
-                return False, f"cursor_cycle_detected:{new_cursor}"
+            return False, f"cursor_cycle_detected:{new_cursor}"
 
         # Check for no advancement (same cursor) BEFORE regression check
         if new_cursor == self.previous_cursor:
