@@ -162,7 +162,8 @@ def normalize_comment_record(video_id: str, record: dict) -> dict:
             likes=_optional_count(record.get("likes")),
             reply_count=_optional_count(record.get("reply_count")),
             created_at_epoch=created_epoch, created_at_utc=created_utc,
-            parent_comment_id=parent_id, is_reply=bool(record.get("is_reply", parent_id is not None)),
+            parent_comment_id=parent_id,
+            is_reply=(record.get("is_reply") is True or record.get("is_reply") == 1 or parent_id is not None),
             collected_at_utc=_optional_string(record.get("collected_at_utc")) or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             dedupe_key=dedupe_key, source_payload=safe_source_payload(record.get("source_payload", {}))
             if isinstance(record.get("source_payload", {}), dict) else {},
