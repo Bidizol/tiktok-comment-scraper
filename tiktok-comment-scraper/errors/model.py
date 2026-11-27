@@ -55,9 +55,9 @@ class ScraperError(Exception):
 
     error_code: str
     severity: ErrorSeverity
-    timestamp_utc: str
     component: str
     function: str
+    timestamp_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     video_id: Optional[str] = None
     run_id: Optional[str] = None
     worker_id: Optional[int] = None
