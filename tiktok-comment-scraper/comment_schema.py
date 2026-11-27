@@ -41,6 +41,16 @@ def _optional_string(value: Any) -> Optional[str]:
     return None
 
 
+def _optional_parent_comment_id(value: Any) -> Optional[str]:
+    """Normalize TikTok's zero-valued root-comment sentinel to no parent."""
+    parent_id = _optional_string(value)
+    return None if parent_id == "0" else parent_id
+
+
+def _is_reply_flag(value: Any) -> bool:
+    return value is True or (isinstance(value, int) and not isinstance(value, bool) and value == 1)
+
+
 def _optional_count(value: Any) -> Optional[int]:
     if isinstance(value, bool) or value is None:
         return None
@@ -147,7 +157,15 @@ def normalize_comment_record(video_id: str, record: dict) -> dict:
         user_id = _optional_string(record.get("user_id"))
         username = _optional_string(record.get("username"))
         nickname = _optional_string(record.get("nickname"))
-        parent_id = _optional_string(record.get("parent_comment_id"))
+        parent_id = _optional_parent_comment_id(record.get("parent_comment_id"))
+        source_payload = record.get("source_payload", {})
+        if isinstance(source_payload, dict) and source_payload:
+            raw_reply_flag = source_payload.get("reply_comment")
+            is_reply = parent_id is not None or _is_reply_flag(raw_reply_flag)
+        else:
+            # Older normalized rows may not retain the source payload needed to
+            # distinguish an explicit reply flag from a legacy zero parent ID.
+            is_reply = parent_id is not None or _is_reply_flag(record.get("is_reply"))
         dedupe_key = "cid:" + comment_id if comment_id else record.get("dedupe_key")
         if comment_id is None and dedupe_key is None and created_epoch is not None:
             fingerprint = json.dumps({
@@ -163,7 +181,7 @@ def normalize_comment_record(video_id: str, record: dict) -> dict:
             reply_count=_optional_count(record.get("reply_count")),
             created_at_epoch=created_epoch, created_at_utc=created_utc,
             parent_comment_id=parent_id,
-            is_reply=(record.get("is_reply") is True or record.get("is_reply") == 1 or parent_id is not None),
+            is_reply=is_reply,
             collected_at_utc=_optional_string(record.get("collected_at_utc")) or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             dedupe_key=dedupe_key, source_payload=safe_source_payload(record.get("source_payload", {}))
             if isinstance(record.get("source_payload", {}), dict) else {},
