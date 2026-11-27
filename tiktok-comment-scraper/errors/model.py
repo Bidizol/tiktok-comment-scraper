@@ -69,6 +69,19 @@ class ScraperError(Exception):
     outcome: ErrorOutcome = ErrorOutcome.FAILED_PERMANENT
     explanation: str = ""
 
+    def __post_init__(self) -> None:
+        """Normalize string enum values accepted by legacy call sites."""
+        if isinstance(self.severity, str):
+            try:
+                self.severity = ErrorSeverity[self.severity]
+            except KeyError:
+                self.severity = ErrorSeverity(self.severity)
+        if isinstance(self.outcome, str):
+            try:
+                self.outcome = ErrorOutcome[self.outcome]
+            except KeyError:
+                self.outcome = ErrorOutcome(self.outcome)
+
     def to_dict(self) -> dict:
         """Convert the error record to a dictionary for JSON serialization."""
         return {
