@@ -46,8 +46,24 @@ PROXY_URL: str = os.environ.get("PROXY_URL", "").strip()
 PROXY_MODE: str = os.environ.get("PROXY_MODE", "optional").strip().lower()
 if PROXY_URL and not (PROXY_HOST and PROXY_PORT):
     _proxy_parts = urlsplit(PROXY_URL)
-    PROXY_HOST = _proxy_parts.hostname or ""
-    PROXY_PORT = str(_proxy_parts.port or "")
+    if (
+        _proxy_parts.scheme.lower() != "http"
+        or not _proxy_parts.hostname
+        or _proxy_parts.path not in {"", "/"}
+        or _proxy_parts.query
+        or _proxy_parts.fragment
+    ):
+        raise ValueError("PROXY_URL must be a valid HTTP proxy endpoint without a path or query")
+    try:
+        _proxy_port = _proxy_parts.port
+    except ValueError as exc:
+        raise ValueError("PROXY_URL contains an invalid port") from exc
+    if _proxy_port is None:
+        raise ValueError("PROXY_URL must include an explicit port")
+    if bool(_proxy_parts.username) != bool(_proxy_parts.password):
+        raise ValueError("PROXY_URL must include both username and password, or neither")
+    PROXY_HOST = _proxy_parts.hostname
+    PROXY_PORT = str(_proxy_port)
     PROXY_USER = unquote(_proxy_parts.username or "")
     PROXY_PASS = unquote(_proxy_parts.password or "")
 PROXY_REQUIRED: bool = (

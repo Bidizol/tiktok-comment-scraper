@@ -136,8 +136,8 @@ class HTTPTransport:
         if proxy_required and not proxy_url: raise ValueError("A proxy is required but no proxy URL was configured")
         if proxy_url:
             proxy=urllib.parse.urlsplit(proxy_url)
-            if proxy.scheme.lower() not in {"http", "https"} or not proxy.hostname:
-                raise ValueError("Proxy URL must be an absolute HTTP(S) URL")
+            if proxy.scheme.lower() != "http" or not proxy.hostname:
+                raise ValueError("Proxy URL must be an absolute HTTP URL")
             if proxy.path not in {"", "/"} or proxy.query or proxy.fragment:
                 raise ValueError("Proxy URL must not contain a path, query or fragment")
             try:
@@ -179,7 +179,10 @@ class HTTPTransport:
             declared=response_headers.get("Content-Length")
             if declared:
                 try:
-                    if int(declared)>self.max_response_bytes:
+                    declared_size = int(declared)
+                    if declared_size < 0:
+                        raise HTTPTransportError("HTTP_RESPONSE_ERROR","HTTP response contained a negative Content-Length",retryable=False,http_status=status)
+                    if declared_size > self.max_response_bytes:
                         raise HTTPTransportError("HTTP_RESPONSE_TOO_LARGE","HTTP response exceeded configured size limit",retryable=False,http_status=status)
                 except ValueError:
                     raise HTTPTransportError("HTTP_RESPONSE_ERROR","HTTP response contained invalid Content-Length",retryable=False,http_status=status)

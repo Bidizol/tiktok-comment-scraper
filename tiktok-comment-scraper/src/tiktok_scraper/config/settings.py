@@ -99,9 +99,9 @@ class Settings:
             )
         if self.proxy_url:
             parsed = urlsplit(self.proxy_url)
-            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            if parsed.scheme != "http" or not parsed.hostname:
                 raise ConfigurationError(
-                    "PROXY_URL must be an absolute HTTP or HTTPS proxy URL"
+                    "PROXY_URL must be an absolute HTTP proxy URL"
                 )
             if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
                 raise ConfigurationError("PROXY_URL must not contain a path, query or fragment")
