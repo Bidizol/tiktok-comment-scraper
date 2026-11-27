@@ -1,9 +1,12 @@
 """TikTok API adapter; TikTok wire-format knowledge lives here."""
 from __future__ import annotations
+import logging
 import random
 import time
 from typing import Any, Dict
 from urllib.parse import urlencode
+
+logger = logging.getLogger(__name__)
 
 from errors.model import ScraperError, ErrorOutcome, ErrorSeverity
 from http_transport import HTTPTransport, HTTPTransportError
@@ -99,9 +102,21 @@ class TikTokAdapter(PlatformAdapter):
             return {"schema_error": "has_more_field_missing"}
         if "cursor" not in data and data.get("has_more") in (True, 1, "1"):
             return {"schema_error": "cursor_field_missing"}
+        raw_total = data.get("total")
+        reported_total = None
+        if isinstance(raw_total, int) and not isinstance(raw_total, bool) and raw_total >= 0:
+            reported_total = raw_total
+        elif isinstance(raw_total, str) and raw_total.isdigit():
+            reported_total = int(raw_total)
+
         return {
-            "http_status": response.status_code, "comments": data.get("comments"),
-            "has_more": data.get("has_more"), "next_cursor": data.get("cursor"),
+            "http_status": response.status_code,
+            "comments": data.get("comments"),
+            "has_more": data.get("has_more"),
+            "next_cursor": data.get("cursor"),
+            "reported_total": reported_total,
+            "page_size": 50,
+            "response_keys": sorted(str(key) for key in data.keys()),
             "error": None,
         }
 

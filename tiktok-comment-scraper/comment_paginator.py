@@ -229,6 +229,22 @@ class CommentPaginator:
                 if not isinstance(comments, list):
                     return self._schema_failure("malformed_comments", "Comment API comments field must be a list")
                 next_cursor = batch.get("next_cursor")
+                reported_total = batch.get("reported_total")
+                page_size = batch.get("page_size", 50)
+                if (reported_total is not None and
+                        (isinstance(reported_total, bool) or not isinstance(reported_total, int)
+                         or reported_total < 0)):
+                    reported_total = None
+                if (isinstance(page_size, bool) or not isinstance(page_size, int)
+                        or page_size < 1 or page_size > 100):
+                    page_size = 50
+                # TikTok can report has_more=False before the end of the
+                # offset-based list. Continue past that provisional signal
+                # when this page contains records or the API's total says
+                # there are still positions beyond the requested cursor.
+                continue_pagination = has_more or bool(comments) or (
+                    reported_total is not None and reported_total > cursor
+                )
                 page_fingerprint = tuple(
                     (
                         str(record.get("cid", "")),
@@ -238,15 +254,19 @@ class CommentPaginator:
                     for record in comments if isinstance(record, dict)
                 )
 
-                if has_more:
+                if continue_pagination:
                     terminal_page_fingerprint = None
                     terminal_confirmation_count = 0
-                    if isinstance(next_cursor, bool) or not isinstance(next_cursor, int) or not 0 <= next_cursor <= MAX_CURSOR_VALUE:
+                    candidate_cursor = next_cursor if has_more else cursor + page_size
+                    if (isinstance(candidate_cursor, bool) or
+                            not isinstance(candidate_cursor, int) or
+                            not 0 <= candidate_cursor <= MAX_CURSOR_VALUE):
                         return self._finish(
                             PaginatorOutcome.PAGINATION_STALLED, PaginationState.PAGINATION_STALLED,
-                            "missing_or_invalid_returned_cursor",
-                            self._error("PAGINATION_ERROR", "API indicated more pages but returned no valid cursor", ErrorOutcome.FAILED_RESUMABLE),
+                            "missing_or_invalid_next_cursor",
+                            self._error("PAGINATION_ERROR", "Pagination could not determine a valid advancing cursor", ErrorOutcome.FAILED_RESUMABLE),
                         )
+                    next_cursor = candidate_cursor
                     can_continue, reason = self.cursor_checker.check_cursor_advancement(next_cursor)
                     if not can_continue:
                         code = "CURSOR_CYCLE" if "cycle" in reason else "CURSOR_STALLED"
@@ -411,9 +431,10 @@ class CommentPaginator:
                 logger.info(
                     "Pagination page received: video_id=%s batch=%d requested_cursor=%s "
                     "returned_cursor=%s has_more=%s records=%d accepted=%d duplicates=%d "
-                    "consecutive_no_new=%d",
+                    "consecutive_no_new=%d reported_total=%s continue_after_page=%s",
                     self.video_id, self.metadata.batch_number, cursor, next_cursor,
                     has_more, records_received, accepted, duplicate_count, consecutive_no_new,
+                    reported_total, continue_pagination,
                 )
 
                 checkpoint_cursor = cursor if page_truncated else next_cursor
@@ -449,7 +470,7 @@ class CommentPaginator:
                     return self._finish(PaginatorOutcome.TRUNCATED_LIMIT, PaginationState.TRUNCATED_LIMIT,
                                         "max_comments_reached", malformed=malformed_records)
 
-                if records_received == 0 and has_more:
+                if records_received == 0 and continue_pagination:
                     if consecutive_empty >= self.max_consecutive_empty:
                         return self._finish(
                             PaginatorOutcome.PAGINATION_STALLED, PaginationState.PAGINATION_STALLED,
@@ -457,7 +478,7 @@ class CommentPaginator:
                             self._error("EMPTY_PAGE_WITH_MORE", "Repeated empty pages claimed additional data was available", ErrorOutcome.FAILED_RESUMABLE),
                             malformed_records,
                         )
-                if records_received > 0 and accepted == 0 and has_more and consecutive_no_new >= self.max_consecutive_empty:
+                if records_received > 0 and accepted == 0 and continue_pagination and consecutive_no_new >= self.max_consecutive_empty:
                     return self._finish(
                         PaginatorOutcome.PAGINATION_STALLED, PaginationState.PAGINATION_STALLED,
                         "no_new_comments_across_pages",
@@ -472,11 +493,11 @@ class CommentPaginator:
                 if accepted > 0:
                     last_progress = time.monotonic()
 
-                if not has_more:
-                    logger.warning(
-                        "TikTok reported a provisional end: video_id=%s cursor=%s "
-                        "records=%d; rechecking same cursor before completion",
-                        self.video_id, cursor, records_received,
+                if not continue_pagination:
+                    logger.info(
+                        "TikTok pagination terminal candidate: video_id=%s cursor=%s "
+                        "records=%d reported_total=%s; confirming same cursor",
+                        self.video_id, cursor, records_received, reported_total,
                     )
                     if self.terminal_confirmation_interval_seconds > 0:
                         time.sleep(self.terminal_confirmation_interval_seconds)
