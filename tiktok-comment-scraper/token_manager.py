@@ -52,7 +52,7 @@ class TokenManager:
                 last=TokenError(error.error_code,str(error),retryable=error.retryable)
                 if not error.retryable: raise last from None
                 ceiling=min(8.0,2.0**(attempt-1))
-                delay=min(error.retry_after_seconds,30.0) if error.retry_after_seconds is not None else random.uniform(0.0,ceiling)
+                delay=min(error.retry_after_seconds,300.0) if error.retry_after_seconds is not None else random.uniform(0.0,ceiling)
             except TokenError as error:
                 last=error
                 if not error.retryable: raise

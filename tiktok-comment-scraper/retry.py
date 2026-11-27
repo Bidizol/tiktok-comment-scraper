@@ -4,7 +4,7 @@ import logging, random, time
 from dataclasses import dataclass
 from typing import Any, Callable, Generic, TypeVar
 logger=logging.getLogger(__name__)
-MAX_DEFAULT_RETRIES=3; DEFAULT_BACKOFF_FACTOR=1.0; MAX_BACKOFF_DELAY=60.0; JITTER_FRACTION=0.25
+MAX_DEFAULT_RETRIES=3; DEFAULT_BACKOFF_FACTOR=1.0; MAX_BACKOFF_DELAY=300.0; JITTER_FRACTION=0.25
 T=TypeVar("T")
 @dataclass
 class RetryRecord:

@@ -9,7 +9,7 @@ the original baseline files.
 """
 import os
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 # Base directory
 BASE_DIR = Path(__file__).parent
@@ -35,7 +35,17 @@ PROXY_HOST: str = os.environ.get("PROXY_HOST", "")
 PROXY_PORT: str = os.environ.get("PROXY_PORT", "")
 PROXY_USER: str = os.environ.get("PROXY_USER", "")
 PROXY_PASS: str = os.environ.get("PROXY_PASS", "")
-PROXY_REQUIRED: bool = os.environ.get("PROXY_REQUIRED", "0").strip().lower() in {"1", "true", "yes"}
+PROXY_URL: str = os.environ.get("PROXY_URL", "").strip()
+PROXY_MODE: str = os.environ.get("PROXY_MODE", "optional").strip().lower()
+if PROXY_URL and not (PROXY_HOST and PROXY_PORT):
+    _proxy_parts = urlsplit(PROXY_URL)
+    PROXY_HOST = _proxy_parts.hostname or ""
+    PROXY_PORT = str(_proxy_parts.port or "")
+    PROXY_USER = unquote(_proxy_parts.username or "")
+    PROXY_PASS = unquote(_proxy_parts.password or "")
+PROXY_REQUIRED: bool = os.environ.get(
+    "PROXY_REQUIRED", "1" if PROXY_MODE == "required" else "0"
+).strip().lower() in {"1", "true", "yes"}
 HTTP_CONNECT_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_CONNECT_TIMEOUT_SECONDS", "15"))
 HTTP_READ_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_READ_TIMEOUT_SECONDS", "20"))
 HTTP_TOTAL_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_TOTAL_TIMEOUT_SECONDS", "30"))
@@ -125,8 +135,12 @@ def validate_config() -> list[str]:
         warnings.append("HTTP_MAX_RESPONSE_BYTES must be at least 1024")
     if HTTP_MAX_RETRIES < 1:
         warnings.append("HTTP_MAX_RETRIES must be >= 1")
+    if PROXY_MODE not in {"disabled", "optional", "required"}:
+        warnings.append("PROXY_MODE must be disabled, optional or required")
+    if PROXY_MODE == "disabled" and (PROXY_HOST or PROXY_PORT or PROXY_URL):
+        warnings.append("PROXY_MODE is disabled but proxy settings are present")
     if PROXY_REQUIRED and not (PROXY_HOST and PROXY_PORT):
-        warnings.append("PROXY_REQUIRED is enabled but PROXY_HOST/PROXY_PORT are missing")
+        warnings.append("PROXY_REQUIRED is enabled but no proxy endpoint is configured")
 
     if COMMENTS_PER_BATCH < 1:
         warnings.append("COMMENTS_PER_BATCH must be >= 1")

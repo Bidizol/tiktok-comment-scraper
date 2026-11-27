@@ -214,7 +214,7 @@ class HTTPTransport:
         return HTTPResponse(status,response_headers,raw,parsed_json,datetime.now(timezone.utc).isoformat())
 
     def request_with_retry(self, method, url, *, headers=None, body=None, expect_json=True,
-                           maximum_attempts=None, max_backoff_seconds=30.0):
+                           maximum_attempts=None, max_backoff_seconds=300.0):
         if method.upper() not in {"GET","HEAD"} or body is not None:
             raise ValueError("Automatic retries are restricted to idempotent GET/HEAD requests")
         maximum_attempts = self.max_retries if maximum_attempts is None else maximum_attempts

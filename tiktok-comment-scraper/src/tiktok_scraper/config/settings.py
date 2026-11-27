@@ -109,7 +109,9 @@ class Settings:
                 if parsed.port is None or not 1 <= parsed.port <= 65535:
                     raise ValueError
             except ValueError as exc:
-                raise ConfigurationError("PROXY_URL contains an invalid port") from exc
+                raise ConfigurationError("PROXY_URL must include a valid explicit port") from exc
+            if bool(parsed.username) != bool(parsed.password):
+                raise ConfigurationError("PROXY_URL must provide both username and password, or neither")
         if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ConfigurationError("LOG_LEVEL is not a supported severity")
         for name, value in (
