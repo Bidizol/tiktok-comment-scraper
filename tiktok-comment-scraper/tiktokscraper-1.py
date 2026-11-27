@@ -393,6 +393,7 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
     duplicates_skipped = 0
     invalid_missing_ids = 0
     naturally_completed = False
+    stop_reason = "stopped_without_terminal_pagination"
 
     def _normalize_cid(cid):
         """Normalize a comment ID for consistent deduplication.
@@ -422,7 +423,20 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
     while True:
         batch_number += 1
 
-        mstoken = token_manager.get_token()
+        try:
+            mstoken = token_manager.get_token()
+        except Exception as token_error:
+            logger.warning("Token acquisition failed for worker %s (%s)", worker_id, type(token_error).__name__)
+            mstoken = None
+
+        if not mstoken:
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_RETRIES:
+                stop_reason = "token_unavailable"
+                safe_print(f"      [W{worker_id}] Token unavailable; retry limit reached")
+                break
+            time.sleep(0.3)
+            continue
 
         # Never expose token values or prefixes in terminal output.
         safe_print(f"      [W{worker_id}][BATCH {batch_number:3d}] cursor={cursor:<6} total={len(all_comments):<5}")
@@ -439,12 +453,14 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
             try:
                 has_more = normalise_has_more(api_response.get("has_more"))
             except ValueError as error:
+                stop_reason = "invalid_has_more_metadata"
                 safe_print(f"      [W{worker_id}][PAGINATION] Invalid has_more metadata: {error}")
                 break
 
             next_cursor = api_response.get("cursor")
             if has_more:
                 if isinstance(next_cursor, bool) or not isinstance(next_cursor, int) or next_cursor <= cursor:
+                    stop_reason = "invalid_or_non_advancing_cursor"
                     safe_print(f"      [W{worker_id}][PAGINATION] Missing, invalid, or non-advancing cursor; stopping safely")
                     break
             else:
@@ -499,6 +515,7 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
 
             # Verificar límite — partial/limited result, never natural completion
             if len(all_comments) >= MAX_COMMENTS:
+                stop_reason = "max_comments_reached"
                 safe_print(f"      [W{worker_id}][LIMITE] Alcanzado {MAX_COMMENTS} comentarios")
                 break
 
@@ -508,11 +525,13 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
             # A missing (None) has_more means we cannot confirm completion;
             # treat it as continued pagination unless we hit another stop condition.
             if page_was_truncated:
+                stop_reason = "max_comments_reached"
                 safe_print(f"      [W{worker_id}][LIMITE] Página parcialmente retenida; cursor no avanzado")
                 break
 
             if has_more is False:
                 naturally_completed = True
+                stop_reason = "api_has_more_false"
                 safe_print(f"      [W{worker_id}][FIN] No hay más comentarios")
                 break
 
@@ -524,6 +543,7 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
             safe_print(f"      [W{worker_id}][BATCH {batch_number:3d}] \u2717 retry {consecutive_failures}/{MAX_RETRIES}")
 
             if consecutive_failures >= MAX_RETRIES:
+                stop_reason = "http_retry_limit_reached"
                 safe_print(f"      [W{worker_id}] Max retries - budget exhausted")
                 break
 
@@ -563,10 +583,13 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
         "proxy_rotations": proxy_rotations,
         "duplicates_skipped": duplicates_skipped,
         "invalid_missing_ids": invalid_missing_ids,
+        "status": "completed" if naturally_completed else "partial",
+        "stop_reason": stop_reason,
         "comments": all_comments,
     }
 
-    safe_print(f"\n [W{worker_id}] COMPLETADO: {video_id}")
+    terminal_label = "COMPLETADO" if naturally_completed else "INCOMPLETO"
+    safe_print(f"\n [W{worker_id}] {terminal_label}: {video_id} ({stop_reason})")
     safe_print(f" [W{worker_id}] \u2192 {result['total_comments']} comentarios | {duplicates_skipped} duplicados omitidos | {invalid_missing_ids} IDs inválidos/faltantes | {result['tokens_used']} tokens")
 
     return result
