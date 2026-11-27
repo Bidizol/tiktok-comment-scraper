@@ -11,7 +11,7 @@ from enum import Enum, auto
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlencode
 
-from http_transport import HTTPTransport
+from http_transport import HTTPTransport, HTTPTransportError
 from pagination_state import (
     CursorIntegrityChecker,
     PaginationMetadata,
@@ -81,8 +81,15 @@ class CommentPaginator:
         if invalid:
             raise ValueError("Pagination limits must be positive: " + ", ".join(invalid))
 
-        self.video_id = str(video_id)
-        self.run_id = run_id
+        if not isinstance(video_id, (str, int)) or isinstance(video_id, bool):
+            raise ValueError("video_id must be a non-empty TikTok video identifier")
+        normalized_video_id = str(video_id).strip()
+        if not normalized_video_id.isdigit() or len(normalized_video_id) > 32:
+            raise ValueError("video_id must contain 1-32 decimal digits")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        self.video_id = normalized_video_id
+        self.run_id = run_id.strip()
         self.worker_id = worker_id
         self.max_batches = max_batches
         self.max_comments = max_comments
@@ -159,11 +166,16 @@ class CommentPaginator:
                         "token_refresh_failed",
                         self._error("TOKEN_REFRESH_ERROR", type(token_error).__name__),
                     )
-                if not isinstance(current_token, str) or not current_token:
+                if (
+                    not isinstance(current_token, str)
+                    or not current_token
+                    or len(current_token) > 4096
+                    or any(character in current_token for character in "\\r\\n")
+                ):
                     return self._finish(
                         PaginatorOutcome.FAILED, PaginationState.FAILED,
                         "token_unavailable",
-                        self._error("TOKEN_UNAVAILABLE", "Pagination token unavailable"),
+                        self._error("TOKEN_REFRESH_ERROR", "Pagination token unavailable or malformed"),
                     )
 
                 try:
@@ -333,23 +345,38 @@ class CommentPaginator:
             "msToken": mstoken,
         })
         url = "https://www.tiktok.com/api/comment/list/?" + query
-        status, data = self.transport.request(
-            "GET",
-            url,
-            headers={
-                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "referer": "https://www.tiktok.com/",
-            },
-        )
-        if not (200 <= status < 300):
-            raise self._error(
-                "HTTP_ERROR",
-                "Comment API request failed",
-                http_status=status,
-                outcome=ErrorOutcome.FAILED_RESUMABLE,
+        try:
+            response = self.transport.request_with_retry(
+                "GET",
+                url,
+                headers={
+                    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "referer": "https://www.tiktok.com/",
+                },
+                expect_json=True,
+                maximum_attempts=3,
             )
+        except HTTPTransportError as transport_error:
+            outcome = (
+                ErrorOutcome.FAILED_RESUMABLE
+                if transport_error.retryable
+                else ErrorOutcome.FAILED_PERMANENT
+            )
+            raise self._error(
+                transport_error.error_code,
+                str(transport_error),
+                http_status=transport_error.http_status,
+                outcome=outcome,
+            ) from transport_error
+
+        status = response.status_code
+        data = response.json_data
         if not isinstance(data, dict):
-            raise self._error("INVALID_JSON", "Comment API returned an invalid JSON object")
+            raise self._error(
+                "API_RESPONSE_ERROR",
+                "Comment API returned an invalid JSON object",
+                http_status=status,
+            )
         return {
             "http_status": status,
             "comments": data.get("comments"),
