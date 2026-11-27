@@ -76,6 +76,9 @@ class HTTPTransport:
         url: str,
         headers: Optional[Dict[str, str]] = None,
         body: Optional[bytes] = None,
+        connect_timeout: Optional[int] = None,
+        read_timeout: Optional[int] = None,
+        overall_timeout: Optional[int] = None,
     ):
         """Execute an HTTP request with full error classification.
 
@@ -87,7 +90,10 @@ class HTTPTransport:
         """
         try:
             req = urllib.request.Request(url, method=method, headers=headers or {}, data=body)
-            url_open = urllib.request.urlopen(req, timeout=self.overall_timeout)
+            # urllib exposes one socket timeout rather than separate connect/read
+            # controls. Use the explicitly supplied overall timeout when present.
+            timeout = overall_timeout if overall_timeout is not None else self.overall_timeout
+            url_open = urllib.request.urlopen(req, timeout=timeout)
             status_code = url_open.getcode()
             raw_body = url_open.read()
             try:
@@ -196,7 +202,7 @@ class HTTPTransport:
 
         Returns (http_status, parsed_dict_or_none) – parsed is None on failure.
         """
-        return self.request("GET, url, headers=headers)
+        return self.request("GET", url, headers=headers)
 
     def validate_status(self, status_code: int) -> bool:
         """Validate that an HTTP status code indicates success.
