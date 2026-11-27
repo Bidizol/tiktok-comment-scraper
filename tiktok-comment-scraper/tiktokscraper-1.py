@@ -2,6 +2,7 @@ import sys
 import os
 import logging
 import threading
+import uuid
 import json
 import time
 import fcntl
@@ -358,22 +359,10 @@ def save_cache(worker_id: int, video_id: str, comments: list, seen_cids: set, ba
 
 
 def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> dict:
-    """Scrape comments for a video with cache resume support.
-
-    Uses terminal pagination evidence (has_more=False) for completion,
-    not merely total_comments == len(comments).
-    An incomplete or failed operation must never become completed because
-    the counts happen to match.
-
-    Returns dict with video_id, author, worker_id, total_comments,
-    total_batches, tokens_used, proxy_rotations, duplicates_skipped,
-    and comments list.
-    """
+    """Scrape one video through the shared bounded pagination state machine."""
     from http_transport import HTTPTransport
     from config import PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS
 
-    # Validate proxy settings before the first network request. A partially
-    # configured proxy must fail closed rather than silently bypassing it.
     proxy_manager = ProxyManager(
         proxy_host=PROXY_HOST,
         proxy_port=PROXY_PORT,
@@ -387,222 +376,148 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
     transport = HTTPTransport(proxy_url=proxy_manager.proxy_url)
     token_manager = TokenManager(worker_id, transport=transport)
 
-    # Attempt to load existing cache for resume
     cached = load_cache(worker_id, video_id)
     if cached and not cached.get("is_complete", False):
-        all_comments = cached.get("comments", [])
+        all_comments = list(cached.get("comments", []))
         seen_cids = set(cached.get("seen_cids", []))
         cursor = cached.get("cursor", 0)
-        batch_number = cached.get("batch_number", 0)
-        safe_print(f"\n [W{worker_id}] RESUMING desde cache: {len(all_comments)} comentarios, batch {batch_number}")
+        base_batch_number = int(cached.get("batch_number", 0))
+        safe_print(
+            f"\n [W{worker_id}] RESUMING desde cache: "
+            f"{len(all_comments)} comentarios, batch {base_batch_number}"
+        )
     else:
         all_comments = []
         seen_cids = set()
         cursor = 0
-        batch_number = 0
+        base_batch_number = 0
 
-    consecutive_failures = 0
-    proxy_rotations = 0
-    duplicates_skipped = 0
-    invalid_missing_ids = 0
-    naturally_completed = False
-    stop_reason = "stopped_without_terminal_pagination"
-
-    def _normalize_cid(cid):
-        """Normalize a comment ID for consistent deduplication.
-
-        Accepts string or integer IDs. Returns a canonical string form for
-        valid IDs, or None for missing/invalid IDs (which must not be treated
-        as duplicates and must not be invented).
-        """
-        if cid is None:
-            return None
-        if isinstance(cid, bool):
-            # bool is a subclass of int in Python; reject it explicitly
-            return None
-        if isinstance(cid, int):
-            return str(cid)
-        if isinstance(cid, str):
-            cid = cid.strip()
-            if cid == "":
-                return None
-            return cid
-        # Any other type (float, list, dict, etc.) is invalid
-        return None
-
-    safe_print(f"\n [W{worker_id}] INICIANDO: {video_id} (@{video_author})")
-    safe_print(f" [W{worker_id}] {'\u2500'*55}")
-
-    while True:
-        batch_number += 1
-
-        try:
-            mstoken = token_manager.get_token()
-        except Exception as token_error:
-            logger.warning("Token acquisition failed for worker %s (%s)", worker_id, type(token_error).__name__)
-            mstoken = None
-
-        if not mstoken:
-            consecutive_failures += 1
-            if consecutive_failures >= MAX_RETRIES:
-                stop_reason = "token_unavailable"
-                safe_print(f"      [W{worker_id}] Token unavailable; retry limit reached")
-                break
-            time.sleep(0.3)
-            continue
-
-        # Never expose token values or prefixes in terminal output.
-        safe_print(f"      [W{worker_id}][BATCH {batch_number:3d}] cursor={cursor:<6} total={len(all_comments):<5}")
-
-        url = f"https://www.tiktok.com/api/comment/list/?aid=1988&aweme_id={video_id}&count={COMMENTS_PER_BATCH}&cursor={cursor}&msToken={mstoken}"
-        http_status, api_response = transport.request("GET", url, headers={"user-agent": USER_AGENT, "referer": "https://www.tiktok.com/"})
-
-        if http_status == 200 and api_response is not None:
-            # Success - process comments
-            page_comments = api_response.get("comments") or []
-            if not isinstance(page_comments, list):
-                page_comments = []
-
-            try:
-                has_more = normalise_has_more(api_response.get("has_more"))
-            except ValueError as error:
-                stop_reason = "invalid_has_more_metadata"
-                safe_print(f"      [W{worker_id}][PAGINATION] Invalid has_more metadata: {error}")
-                break
-
-            next_cursor = api_response.get("cursor")
-            if has_more:
-                if isinstance(next_cursor, bool) or not isinstance(next_cursor, int) or next_cursor <= cursor:
-                    stop_reason = "invalid_or_non_advancing_cursor"
-                    safe_print(f"      [W{worker_id}][PAGINATION] Missing, invalid, or non-advancing cursor; stopping safely")
-                    break
-            else:
-                # No next cursor is needed after the API explicitly marks the
-                # final page. Keep the last confirmed cursor in the checkpoint.
-                next_cursor = cursor
-
-            # Stage candidates first. Only IDs belonging to comments actually
-            # retained below are added to seen_cids.
-            candidates = []
-            for comment in page_comments:
-                if not isinstance(comment, dict):
-                    continue
-                raw_cid = comment.get("cid")
-                cid = _normalize_cid(raw_cid)
-                if cid is None:
-                    invalid_missing_ids += 1
-                    candidates.append((comment, None))
-                elif cid not in seen_cids:
-                    candidates.append((comment, cid))
-                else:
-                    duplicates_skipped += 1
-
-            remaining = max(0, MAX_COMMENTS - len(all_comments))
-            retained = candidates[:remaining]
-            page_was_truncated = len(retained) < len(candidates)
-            for comment, cid in retained:
-                all_comments.append(comment)
-                if cid is not None:
-                    seen_cids.add(cid)
-            consecutive_failures = 0
-
-            # If a page was only partly retained, do not advance its cursor:
-            # resumption must refetch that page rather than skip its remainder.
-            checkpoint_cursor = cursor if page_was_truncated else next_cursor
-
-            if batch_number % SAVE_EVERY_N_BATCHES == 0:
-                saved_path, save_error = save_and_load_cache_safe(
-                    cache_dir=CACHE_DIR,
-                    worker_id=worker_id,
-                    video_id=video_id,
-                    comments=all_comments,
-                    seen_cids=seen_cids,
-                    batch_number=batch_number,
-                    cursor=checkpoint_cursor,
-                    is_final=False,
-                )
-                if save_error:
-                    safe_print(f"      [W{worker_id}][CACHE] Save error (data preserved in memory): {save_error}")
-                elif saved_path:
-                    safe_print(f"      [W{worker_id}][CACHE] Guardado: {len(all_comments)} comentarios (batch {batch_number})")
-
-            # Verificar límite — partial/limited result, never natural completion
-            if len(all_comments) >= MAX_COMMENTS:
-                stop_reason = "max_comments_reached"
-                safe_print(f"      [W{worker_id}][LIMITE] Alcanzado {MAX_COMMENTS} comentarios")
-                break
-
-            # Check for terminal pagination evidence - completion requires
-            # valid terminal pagination (has_more=False received from the API),
-            # not just count matching or missing/malformed has_more.
-            # A missing (None) has_more means we cannot confirm completion;
-            # treat it as continued pagination unless we hit another stop condition.
-            if page_was_truncated:
-                stop_reason = "max_comments_reached"
-                safe_print(f"      [W{worker_id}][LIMITE] Página parcialmente retenida; cursor no avanzado")
-                break
-
-            if has_more is False:
-                naturally_completed = True
-                stop_reason = "api_has_more_false"
-                safe_print(f"      [W{worker_id}][FIN] No hay más comentarios")
-                break
-
-            cursor = checkpoint_cursor
-
-        else:
-            # API error or no response - treat as failure
-            consecutive_failures += 1
-            safe_print(f"      [W{worker_id}][BATCH {batch_number:3d}] \u2717 retry {consecutive_failures}/{MAX_RETRIES}")
-
-            if consecutive_failures >= MAX_RETRIES:
-                stop_reason = "http_retry_limit_reached"
-                safe_print(f"      [W{worker_id}] Max retries - budget exhausted")
-                break
-
-        time.sleep(0.3)
-
-    # Trim a exactly MAX_COMMENTS
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+        cursor = 0
     if len(all_comments) > MAX_COMMENTS:
         all_comments = all_comments[:MAX_COMMENTS]
 
-    # Guardar cache final - is_final only if scrape completed naturally via has_more=False
-    # Never mark incomplete scrapes as completed (invariant maintenance)
-    is_final = naturally_completed
+    duplicates_skipped = 0
+    invalid_missing_ids = 0
+    last_checkpoint_cursor = cursor
+    last_checkpoint_batch = base_batch_number
+    cache_errors = []
 
+    def normalize_cid(cid):
+        if cid is None or isinstance(cid, bool):
+            return None
+        if isinstance(cid, int):
+            return str(cid)
+        if isinstance(cid, str) and cid.strip():
+            return cid.strip()
+        return None
+
+    def retain_comment(comment):
+        nonlocal duplicates_skipped, invalid_missing_ids
+        if not isinstance(comment, dict):
+            invalid_missing_ids += 1
+            return False
+        cid = normalize_cid(comment.get("cid"))
+        if cid is None:
+            invalid_missing_ids += 1
+            all_comments.append(comment)
+            return True
+        if cid in seen_cids:
+            duplicates_skipped += 1
+            return False
+        seen_cids.add(cid)
+        all_comments.append(comment)
+        return True
+
+    def persist_batch(batch_info):
+        nonlocal last_checkpoint_cursor, last_checkpoint_batch
+        last_checkpoint_cursor = batch_info["checkpoint_cursor"]
+        last_checkpoint_batch = base_batch_number + batch_info["batch_number"]
+        _, save_error = save_and_load_cache_safe(
+            cache_dir=CACHE_DIR,
+            worker_id=worker_id,
+            video_id=video_id,
+            comments=all_comments,
+            seen_cids=seen_cids,
+            batch_number=last_checkpoint_batch,
+            cursor=last_checkpoint_cursor,
+            is_final=False,
+        )
+        if save_error:
+            cache_errors.append(str(save_error))
+            safe_print(
+                f"      [W{worker_id}][CACHE] Save error "
+                f"(data retained in memory): {save_error}"
+            )
+
+    safe_print(f"\n [W{worker_id}] INICIANDO: {video_id} (@{video_author})")
+    safe_print(f" [W{worker_id}] {'─' * 55}")
+
+    remaining_comments = max(0, MAX_COMMENTS - len(all_comments))
+    if remaining_comments > 0:
+        paginator = CommentPaginator(
+            video_id=video_id,
+            run_id=str(uuid.uuid4()),
+            worker_id=worker_id,
+            max_batches=max(1, DEFAULT_MAX_BATCHES - base_batch_number),
+            max_comments=remaining_comments,
+            transport=transport,
+        )
+        pagination_result = paginator.run(
+            initial_cursor=cursor,
+            mstoken=token_manager.get_token,
+            on_comment=retain_comment,
+            on_batch=persist_batch,
+        )
+        naturally_completed = pagination_result.outcome == PaginatorOutcome.COMPLETED
+        stop_reason = pagination_result.metadata.stop_reason or pagination_result.outcome.name.lower()
+        total_batches = base_batch_number + pagination_result.metadata.batch_number
+        last_checkpoint_cursor = (
+            last_checkpoint_cursor
+            if pagination_result.metadata.stop_reason == "max_comments_reached"
+            else pagination_result.metadata.returned_cursor
+        )
+    else:
+        naturally_completed = False
+        stop_reason = "max_comments_reached"
+        total_batches = base_batch_number
+
+    # A partial/failed pagination result must never be saved as complete.
     saved_path, save_error = save_and_load_cache_safe(
         cache_dir=CACHE_DIR,
         worker_id=worker_id,
         video_id=video_id,
         comments=all_comments,
         seen_cids=seen_cids,
-        batch_number=batch_number,
-        cursor=cursor,
-        is_final=is_final,
+        batch_number=total_batches,
+        cursor=last_checkpoint_cursor,
+        is_final=naturally_completed,
     )
     if save_error:
+        cache_errors.append(str(save_error))
         safe_print(f"      [W{worker_id}][CACHE] Final save error: {save_error}")
-
-    # Track tokens used (TokenManager in this version doesn't track total_tokens_used)
-    tokens_used = getattr(token_manager, 'total_tokens_used', 0)
 
     result = {
         "video_id": video_id,
         "author": video_author,
         "worker_id": worker_id,
         "total_comments": len(all_comments),
-        "total_batches": batch_number,
-        "tokens_used": tokens_used,
-        "proxy_rotations": proxy_rotations,
+        "total_batches": total_batches,
+        "tokens_used": getattr(token_manager, "total_tokens_used", 0),
+        "proxy_rotations": 0,
         "duplicates_skipped": duplicates_skipped,
         "invalid_missing_ids": invalid_missing_ids,
         "status": "completed" if naturally_completed else "partial",
         "stop_reason": stop_reason,
+        "cache_errors": cache_errors,
         "comments": all_comments,
     }
 
     terminal_label = "COMPLETADO" if naturally_completed else "INCOMPLETO"
     safe_print(f"\n [W{worker_id}] {terminal_label}: {video_id} ({stop_reason})")
-    safe_print(f" [W{worker_id}] \u2192 {result['total_comments']} comentarios | {duplicates_skipped} duplicados omitidos | {invalid_missing_ids} IDs inválidos/faltantes | {result['tokens_used']} tokens")
-
+    safe_print(
+        f" [W{worker_id}] → {result['total_comments']} comentarios | "
+        f"{duplicates_skipped} duplicados omitidos | "
+        f"{invalid_missing_ids} IDs inválidos/faltantes"
+    )
     return result
