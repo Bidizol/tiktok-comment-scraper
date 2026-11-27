@@ -267,10 +267,31 @@ class TokenManager:
             if not isinstance(response, dict):
                 raise ValueError("Expected dict response from TikTok token endpoint")
 
-            # Attempt to extract msToken from the response
-            # The actual extraction depends on TikTok's API format
-            # Pattern: look for msToken-like fields
-            ms_token = response.get("msToken") or response.get("token") or response.get("unique_id")
+            # TikTok commonly issues msToken as a response cookie rather
+            # than a JSON property. Prefer that cookie, with JSON fields as
+            # compatibility fallbacks for alternate endpoint responses.
+            ms_token = None
+            response_headers = getattr(self._transport, "last_response_headers", None)
+            if response_headers is not None:
+                from http.cookies import SimpleCookie
+
+                cookie_headers = (
+                    response_headers.get_all("Set-Cookie", [])
+                    if hasattr(response_headers, "get_all")
+                    else []
+                )
+                parsed_cookies = SimpleCookie()
+                for cookie_header in cookie_headers:
+                    parsed_cookies.load(cookie_header)
+                if "msToken" in parsed_cookies:
+                    ms_token = parsed_cookies["msToken"].value
+
+            if not ms_token:
+                ms_token = (
+                    response.get("msToken")
+                    or response.get("token")
+                    or response.get("unique_id")
+                )
 
             if ms_token:
                 # Return the token string - caller is responsible for extraction
