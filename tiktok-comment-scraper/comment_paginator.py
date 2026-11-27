@@ -40,6 +40,7 @@ DEFAULT_MAX_CONSECUTIVE_EMPTY = 3
 DEFAULT_STALLED_TIMEOUT_SECONDS = 300
 DEFAULT_ELAPSED_TIMEOUT_SECONDS = 600
 MAX_CURSOR_VALUE = (2 ** 63) - 1
+MAX_MALFORMED_RECORDS_IN_MEMORY = 1_000
 
 
 class PaginationStop(Exception):
@@ -164,6 +165,12 @@ class CommentPaginator:
         consecutive_no_new = 0
         malformed_records: List[Any] = []
 
+        def remember_malformed(record: Any) -> None:
+            # Every malformed record is persisted by the quarantine callback;
+            # retain only a bounded sample in the in-memory run result.
+            if len(malformed_records) < MAX_MALFORMED_RECORDS_IN_MEMORY:
+                malformed_records.append(record)
+
         try:
             while True:
                 if self.stop_event is not None and self.stop_event.is_set():
@@ -259,7 +266,7 @@ class CommentPaginator:
                 for record in retained:
                     if not isinstance(record, dict):
                         reason = "comment_record_not_object"
-                        malformed_records.append(record)
+                        remember_malformed(record)
                         malformed_count += 1
                         if on_malformed_comment is not None:
                             try:
@@ -274,7 +281,7 @@ class CommentPaginator:
                         continue
                     if not self._comment_shape_is_recognized(record):
                         reason = "unrecognized_comment_schema"
-                        malformed_records.append(record)
+                        remember_malformed(record)
                         malformed_count += 1
                         if on_malformed_comment is not None:
                             try:
@@ -289,7 +296,7 @@ class CommentPaginator:
                         continue
                     if not self._has_minimum_content(record):
                         reason = "comment_text_missing_or_invalid"
-                        malformed_records.append(record)
+                        remember_malformed(record)
                         malformed_count += 1
                         if on_malformed_comment is not None:
                             try:

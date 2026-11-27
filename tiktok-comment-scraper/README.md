@@ -39,7 +39,7 @@ The stable record includes:
 
 Missing comment IDs do not cause a comment to be discarded. When a usable timestamp exists, a deterministic fingerprint is used for deduplication. This is a heuristic: two genuinely distinct comments with identical author, text, timestamp and parent may share a fingerprint. Records without a usable timestamp are retained without fingerprint-based deduplication.
 
-Malformed source records are retained in restricted JSONL files under `cache/quarantine/`; they are not silently converted into empty comments.
+Malformed source records are retained in restricted JSONL files under `cache/quarantine/`; they are not silently converted into empty comments. Each video's quarantine file is capped at 50 MiB, and the in-memory malformed-record sample is capped at 1,000 entries per video.
 
 ## Configuration
 
