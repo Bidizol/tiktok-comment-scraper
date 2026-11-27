@@ -1,0 +1,35 @@
+{
+  "timestamp": "2026-11-26T11:12:49.539510",
+  "proxy_ip": "desactivado",
+  "config": {
+    "max_comments": 10000,
+    "deduplication": true,
+    "pagination_system": "CommentPaginator with CursorIntegrityChecker",
+    "has_more_normalisation": "normalise_has_more()"
+  },
+  "summary": {
+    "total_comments": 0,
+    "duplicates_skipped": 0,
+    "malformed_rejected": 0,
+    "comments_with_missing_cid": 0,
+    "elapsed_seconds": 0.0010027885437011719
+  },
+  "videos": [
+    {
+      "video_id": "7676572010415230221",
+      "author": "erickie20",
+      "worker_id": 1,
+      "total_comments": 0,
+      "total_batches": 0,
+      "tokens_used": 0,
+      "proxy_rotations": 0,
+      "duplicates_skipped": 0,
+      "malformed_rejected": 0,
+      "comments_with_missing_cid": 0,
+      "comments": [],
+      "run_status": "FAILED",
+      "stop_reason": null,
+      "outcome": "FAILED"
+    }
+  ]
+}
