@@ -152,75 +152,28 @@ class HTTPTransport:
         self,
         url: str,
         headers: Optional[Dict[str, str]] = None,
-    ) -> Tuple[int, Optional[Dict[str, Any]]]:
-        """Fetch and parse JSON from a URL using this transport instance.
-
-        Thin convenience wrapper over :meth:`request` so callers holding a
-        transport instance (e.g. the TokenManager) share the same centralized,
-        configured HTTP behavior instead of reaching for module-level helpers.
-
-        Returns (http_status, parsed_dict_or_none) – parsed is None on failure.
-        """
-        return self.request("GET", url, headers=headers)
-
-    def validate_status(self, status_code: int) -> bool:
-        """Validate that an HTTP status code indicates success.
-
-        Returns True for 2xx status codes only.
-        """
-        return 200 <= status_code < 300
-    def fetch_json(
-        self,
-        url: str,
-        headers: Optional[Dict[str, str]] = None,
-    ) -> Tuple[int, Optional[Dict[str, Any]]]:
-        """Fetch and parse JSON from a URL using this transport instance.
-
-        Thin convenience wrapper over :meth:`request` so callers holding a
-        transport instance (e.g. the TokenManager) share the same centralized,
-        configured HTTP behavior instead of reaching for module-level helpers.
-
-        Returns (http_status, parsed_dict_or_none) – parsed is None on failure.
-        """
-        return self.request("GET", url, headers=headers)
-    def validate_status(self, status_code: int) -> bool:
-        """Validate that an HTTP status code indicates success.
-
-        Returns True for 2xx status codes only.
-        """
-        return 200 <= status_code < 300
-
-    def fetch_json(
-        self,
-        url: str,
-        headers: Optional[Dict[str, str]] = None,
         connect_timeout: Optional[int] = None,
         read_timeout: Optional[int] = None,
         overall_timeout: Optional[int] = None,
     ) -> Tuple[int, Optional[Dict[str, Any]]]:
-        """Fetch and parse JSON from a URL using this transport instance.
+        """Fetch JSON using this transport's configured timeout policy.
 
-        Thin convenience wrapper over :meth:`request` so callers holding a
-        transport instance (e.g. the TokenManager) share the same configured,
-        centralized HTTP behavior instead of reaching for module-level helpers.
-
-        Returns (http_status, parsed_dict_or_none) – parsed is None on failure.
+        urllib currently applies one socket timeout; connect_timeout and
+        read_timeout are accepted for caller compatibility but are not
+        independently enforceable by urllib.
         """
         return self.request(
             "GET",
             url,
             headers=headers,
-            connect_timeout=connect_timeout or self.connect_timeout,
-            read_timeout=read_timeout or self.read_timeout,
-            overall_timeout=overall_timeout or self.overall_timeout,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            overall_timeout=overall_timeout,
         )
+
     def validate_status(self, status_code: int) -> bool:
-        """Validate that an HTTP status code indicates success.
-
-        Returns True for 2xx status codes only.
-        """
+        """Return True only for successful 2xx HTTP status codes."""
         return 200 <= status_code < 300
-
 
 def fetch_json(
     url: str,
