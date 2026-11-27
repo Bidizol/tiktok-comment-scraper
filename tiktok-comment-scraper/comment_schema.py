@@ -209,9 +209,9 @@ def normalize_tiktok_comment(video_id: str, record: dict) -> NormalizedComment:
     )
     likes = _optional_count(record.get("digg_count", record.get("like_count")))
     replies = _optional_count(record.get("reply_comment_total", record.get("reply_count")))
-    parent_id = _optional_string(record.get("reply_id", record.get("reply_to_comment_id")))
+    parent_id = _optional_parent_comment_id(record.get("reply_id", record.get("reply_to_comment_id")))
     raw_reply_flag = record.get("reply_comment", False)
-    is_reply = parent_id is not None or raw_reply_flag is True or raw_reply_flag == 1
+    is_reply = parent_id is not None or _is_reply_flag(raw_reply_flag)
     collected = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     stable_parts = {
         "video_id": str(video_id), "user_id": user_id, "username": username,
