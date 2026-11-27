@@ -19,7 +19,7 @@ class TokenManager:
     def __init__(self,worker_id,initial_token=None,token_ttl_seconds=DEFAULT_TOKEN_TTL_SECONDS,
                  transport=None,max_refresh_attempts=MAX_REFRESH_ATTEMPTS,refresh_endpoint=TOKEN_ENDPOINT):
         if isinstance(token_ttl_seconds,bool) or token_ttl_seconds<1: raise ValueError("token_ttl_seconds must be positive")
-        if isinstance(max_refresh_attempts,bool) or max_refresh_attempts<1: raise ValueError("max_refresh_attempts must be positive")
+        if isinstance(max_refresh_attempts,bool) or not isinstance(max_refresh_attempts,int) or not 1<=max_refresh_attempts<=10: raise ValueError("max_refresh_attempts must be an integer between 1 and 10")
         self.worker_id=worker_id; self._token=initial_token
         self._issued=time.monotonic() if initial_token else None
         self._ttl=token_ttl_seconds; self._max_attempts=max_refresh_attempts

@@ -119,8 +119,12 @@ class Settings:
             ("HTTP_CONNECT_TIMEOUT_SECONDS", self.connect_timeout_seconds),
             ("HTTP_READ_TIMEOUT_SECONDS", self.read_timeout_seconds),
         ):
-            if not math.isfinite(value) or value <= 0:
-                raise ConfigurationError(f"{name} must be a finite positive number")
+            if not math.isfinite(value) or value <= 0 or value > 600:
+                raise ConfigurationError(f"{name} must be finite and between 0 and 600 seconds")
+        if self.max_http_retries > 10:
+            raise ConfigurationError("HTTP_MAX_RETRIES must not exceed 10")
+        if self.max_response_bytes > 50 * 1024 * 1024:
+            raise ConfigurationError("HTTP_MAX_RESPONSE_BYTES must not exceed 52428800")
 
     @classmethod
     def from_environment(

@@ -43,9 +43,10 @@ if PROXY_URL and not (PROXY_HOST and PROXY_PORT):
     PROXY_PORT = str(_proxy_parts.port or "")
     PROXY_USER = unquote(_proxy_parts.username or "")
     PROXY_PASS = unquote(_proxy_parts.password or "")
-PROXY_REQUIRED: bool = os.environ.get(
-    "PROXY_REQUIRED", "1" if PROXY_MODE == "required" else "0"
-).strip().lower() in {"1", "true", "yes"}
+PROXY_REQUIRED: bool = (
+    PROXY_MODE == "required"
+    or os.environ.get("PROXY_REQUIRED", "0").strip().lower() in {"1", "true", "yes"}
+)
 HTTP_CONNECT_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_CONNECT_TIMEOUT_SECONDS", "15"))
 HTTP_READ_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_READ_TIMEOUT_SECONDS", "20"))
 HTTP_TOTAL_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_TOTAL_TIMEOUT_SECONDS", "30"))
@@ -131,14 +132,12 @@ def validate_config() -> list[str]:
     ):
         if not __import__("math").isfinite(value) or value <= 0:
             warnings.append(f"{name} must be a finite positive number")
-    if HTTP_MAX_RESPONSE_BYTES < 1024:
-        warnings.append("HTTP_MAX_RESPONSE_BYTES must be at least 1024")
-    if HTTP_MAX_RETRIES < 1:
-        warnings.append("HTTP_MAX_RETRIES must be >= 1")
+    if HTTP_MAX_RESPONSE_BYTES < 1024 or HTTP_MAX_RESPONSE_BYTES > 50 * 1024 * 1024:
+        warnings.append("HTTP_MAX_RESPONSE_BYTES must be between 1024 and 52428800")
+    if HTTP_MAX_RETRIES < 1 or HTTP_MAX_RETRIES > 10:
+        warnings.append("HTTP_MAX_RETRIES must be between 1 and 10")
     if PROXY_MODE not in {"disabled", "optional", "required"}:
         warnings.append("PROXY_MODE must be disabled, optional or required")
-    if PROXY_MODE == "disabled" and (PROXY_HOST or PROXY_PORT or PROXY_URL):
-        warnings.append("PROXY_MODE is disabled but proxy settings are present")
     if PROXY_REQUIRED and not (PROXY_HOST and PROXY_PORT):
         warnings.append("PROXY_REQUIRED is enabled but no proxy endpoint is configured")
 

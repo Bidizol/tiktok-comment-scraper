@@ -1,6 +1,6 @@
 """Bounded retry policy with structured classification and jitter."""
 from __future__ import annotations
-import logging, random, time
+import logging, math, random, time
 from dataclasses import dataclass
 from typing import Any, Callable, Generic, TypeVar
 logger=logging.getLogger(__name__)
@@ -20,7 +20,10 @@ class RetryPolicy:
     retryable_error_codes:tuple[str,...]=("RATE_LIMITED","NETWORK_ERROR","DNS_ERROR","TIMEOUT_ERROR","HTTP_SERVER_ERROR","PROXY_ERROR")
     permanent_error_codes:tuple[str,...]=("AUTHENTICATION_ERROR","ACCESS_RESTRICTED","PROXY_AUTHENTICATION_ERROR","TLS_ERROR","HTTP_CLIENT_ERROR","JSON_DECODE_ERROR","API_RESPONSE_ERROR","UNEXPECTED_INTERNAL_ERROR")
     def __post_init__(self):
-        if isinstance(self.maximum_attempts,bool) or self.maximum_attempts<1: raise ValueError("maximum_attempts must be at least 1")
+        if isinstance(self.maximum_attempts,bool) or not isinstance(self.maximum_attempts,int) or not 1<=self.maximum_attempts<=10:
+            raise ValueError("maximum_attempts must be an integer between 1 and 10")
+        if not all(math.isfinite(v) for v in (self.backoff_factor,self.max_backoff_delay,self.jitter_fraction)):
+            raise ValueError("Backoff settings must be finite numbers")
         if self.backoff_factor<0 or self.max_backoff_delay<0: raise ValueError("Backoff values cannot be negative")
         if not 0<=self.jitter_fraction<=1: raise ValueError("jitter_fraction must be between 0 and 1")
 class BoundedRetry(Generic[T]):
@@ -60,7 +63,8 @@ class BoundedRetry(Generic[T]):
                     backoff_decision="pending",recovery_action="retry_transient_operation" if should_retry else "stop")
                 self.records.append(record)
                 if not should_retry:
-                    record.recovery_outcome="retry_exhausted" if retryable else "permanent_failure"
+                    can_retry = bool(retryable) if retryable is not None else code in self.policy.retryable_error_codes
+                    record.recovery_outcome="retry_exhausted" if can_retry else "permanent_failure"
                     logger.warning("Operation stopped after attempt %d (%s)",attempt,code)
                     return None,self.records
                 retry_after=getattr(error,"retry_after_seconds",None)

@@ -132,8 +132,8 @@ class HTTPTransport:
                     raise ValueError
             except ValueError as exc:
                 raise ValueError("Proxy URL must include a valid explicit port") from exc
-        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 1:
-            raise ValueError("max_retries must be a positive integer")
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or not 1 <= max_retries <= 10:
+            raise ValueError("max_retries must be an integer between 1 and 10")
         self.proxy_url=proxy_url; self.proxy_required=bool(proxy_required)
         self.max_response_bytes=max_response_bytes; self.max_retries=max_retries
 
@@ -218,8 +218,8 @@ class HTTPTransport:
         if method.upper() not in {"GET","HEAD"} or body is not None:
             raise ValueError("Automatic retries are restricted to idempotent GET/HEAD requests")
         maximum_attempts = self.max_retries if maximum_attempts is None else maximum_attempts
-        if isinstance(maximum_attempts,bool) or not isinstance(maximum_attempts,int) or maximum_attempts<1:
-            raise ValueError("maximum_attempts must be a positive integer")
+        if isinstance(maximum_attempts,bool) or not isinstance(maximum_attempts,int) or not 1 <= maximum_attempts <= 10:
+            raise ValueError("maximum_attempts must be an integer between 1 and 10")
         if not math.isfinite(max_backoff_seconds) or max_backoff_seconds < 0:
             raise ValueError("max_backoff_seconds must be finite and non-negative")
         last=None

@@ -362,10 +362,15 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
     """Scrape one video through the shared bounded pagination state machine."""
     from http_transport import HTTPTransport
     from config import (
-        PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS, PROXY_REQUIRED,
+        PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS, PROXY_REQUIRED, PROXY_MODE,
         HTTP_CONNECT_TIMEOUT_SECONDS, HTTP_READ_TIMEOUT_SECONDS,
         HTTP_TOTAL_TIMEOUT_SECONDS, HTTP_MAX_RESPONSE_BYTES, HTTP_MAX_RETRIES,
     )
+
+    if PROXY_MODE == "disabled" and (PROXY_HOST or PROXY_PORT):
+        raise ValueError("Proxy settings are present while PROXY_MODE is disabled")
+    if PROXY_MODE not in {"disabled", "optional", "required"}:
+        raise ValueError("PROXY_MODE must be disabled, optional or required")
 
     proxy_manager = ProxyManager(
         proxy_host=PROXY_HOST,
