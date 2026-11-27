@@ -154,10 +154,10 @@ class HTTPTransport:
     ) -> Tuple[int, Optional[Dict[str, Any]]]:
         """Execute one HTTP request and return (status, parsed JSON object).
 
-        urllib exposes a single socket timeout, so overall_timeout is used when
-        supplied. connect_timeout/read_timeout remain accepted for API
-        compatibility; separate phase timeouts require a different transport.
-        HTTP, network, and malformed-JSON failures return a status and None.
+        Connection establishment and subsequent socket I/O use separate
+        timeouts. overall_timeout caps each socket timeout; it is not a strict
+        wall-clock deadline for the complete request. HTTP, network, and
+        malformed-JSON failures return a status and None.
         """
         timeout = overall_timeout if overall_timeout is not None else self.overall_timeout
         connect_limit = connect_timeout if connect_timeout is not None else self.connect_timeout
@@ -249,9 +249,9 @@ class HTTPTransport:
     ) -> Tuple[int, Optional[Dict[str, Any]]]:
         """Fetch JSON using this transport's configured timeout policy.
 
-        urllib currently applies one socket timeout; connect_timeout and
-        read_timeout are accepted for caller compatibility but are not
-        independently enforceable by urllib.
+        Connection and read timeouts are enforced by the custom urllib
+        connection handlers. overall_timeout caps both values but does not
+        impose a strict wall-clock deadline.
         """
         return self.request(
             "GET",
