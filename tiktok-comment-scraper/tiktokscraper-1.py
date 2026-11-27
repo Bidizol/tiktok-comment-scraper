@@ -372,7 +372,8 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
     """
     from http_transport import HTTPTransport
 
-    token_manager = TokenManager(worker_id)
+    transport = HTTPTransport()
+    token_manager = TokenManager(worker_id, transport=transport)
 
     # Attempt to load existing cache for resume
     cached = load_cache(worker_id, video_id)
@@ -419,15 +420,13 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
     safe_print(f"\n [W{worker_id}] INICIANDO: {video_id} (@{video_author})")
     safe_print(f" [W{worker_id}] {'\u2500'*55}")
 
-    transport = HTTPTransport()
-
     while True:
         batch_number += 1
 
         mstoken = token_manager.get_token()
 
-        token_short = mstoken[:8] + "..." if mstoken else "NO_TOKEN"
-        safe_print(f"      [W{worker_id}][BATCH {batch_number:3d}] cursor={cursor:<6} token={token_short} total={len(all_comments):<5}")
+        # Never expose token values or prefixes in terminal output.
+        safe_print(f"      [W{worker_id}][BATCH {batch_number:3d}] cursor={cursor:<6} total={len(all_comments):<5}")
 
         url = f"https://www.tiktok.com/api/comment/list/?aid=1988&aweme_id={video_id}&count={COMMENTS_PER_BATCH}&cursor={cursor}&msToken={mstoken}"
         http_status, api_response = transport.request("GET", url, headers={"user-agent": USER_AGENT, "referer": "https://www.tiktok.com/"})
@@ -438,45 +437,51 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
             if not isinstance(page_comments, list):
                 page_comments = []
 
-            has_more = api_response.get("has_more")
-            next_cursor = api_response.get("cursor", cursor + COMMENTS_PER_BATCH)
+            try:
+                has_more = normalise_has_more(api_response.get("has_more"))
+            except ValueError as error:
+                safe_print(f"      [W{worker_id}][PAGINATION] Invalid has_more metadata: {error}")
+                break
 
-            # Deduplicar en O(1) usando set.
-            # Phase 5 Block 3.1: missing or malformed cids are never classified
-            # as duplicates and never silently discarded. They are preserved and
-            # counted separately in diagnostics.
-            new_comments = []
+            next_cursor = api_response.get("cursor")
+            if has_more:
+                if isinstance(next_cursor, bool) or not isinstance(next_cursor, int) or next_cursor <= cursor:
+                    safe_print(f"      [W{worker_id}][PAGINATION] Missing, invalid, or non-advancing cursor; stopping safely")
+                    break
+            else:
+                # No next cursor is needed after the API explicitly marks the
+                # final page. Keep the last confirmed cursor in the checkpoint.
+                next_cursor = cursor
+
+            # Stage candidates first. Only IDs belonging to comments actually
+            # retained below are added to seen_cids.
+            candidates = []
             for comment in page_comments:
                 if not isinstance(comment, dict):
                     continue
                 raw_cid = comment.get("cid")
                 cid = _normalize_cid(raw_cid)
                 if cid is None:
-                    # Missing or invalid ID: preserve the comment, count it in
-                    # diagnostics, do NOT add to seen_cids (never invent/dedup).
                     invalid_missing_ids += 1
-                    new_comments.append(comment)
-                    continue
-                if cid not in seen_cids:
-                    seen_cids.add(cid)
-                    new_comments.append(comment)
+                    candidates.append((comment, None))
+                elif cid not in seen_cids:
+                    candidates.append((comment, cid))
                 else:
                     duplicates_skipped += 1
 
-            # Phase 5 Block 3.1: Enforce MAX_COMMENTS — never store more
-            # comments than the configured limit. Cap new_comments to the
-            # remaining slots so seen_cids only ever reflects comments actually
-            # kept, and the checkpoint is saved with at most MAX_COMMENTS.
-            remaining = MAX_COMMENTS - len(all_comments)
-            if remaining > 0:
-                new_comments = new_comments[:remaining]
-            else:
-                new_comments = []
-
-            all_comments.extend(new_comments)
+            remaining = max(0, MAX_COMMENTS - len(all_comments))
+            retained = candidates[:remaining]
+            page_was_truncated = len(retained) < len(candidates)
+            for comment, cid in retained:
+                all_comments.append(comment)
+                if cid is not None:
+                    seen_cids.add(cid)
             consecutive_failures = 0
 
-            # Guardar cache cada N batches (atomic read-modify-write under single lock)
+            # If a page was only partly retained, do not advance its cursor:
+            # resumption must refetch that page rather than skip its remainder.
+            checkpoint_cursor = cursor if page_was_truncated else next_cursor
+
             if batch_number % SAVE_EVERY_N_BATCHES == 0:
                 saved_path, save_error = save_and_load_cache_safe(
                     cache_dir=CACHE_DIR,
@@ -485,7 +490,7 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
                     comments=all_comments,
                     seen_cids=seen_cids,
                     batch_number=batch_number,
-                    cursor=next_cursor,
+                    cursor=checkpoint_cursor,
                     is_final=False,
                 )
                 if save_error:
@@ -503,12 +508,16 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
             # not just count matching or missing/malformed has_more.
             # A missing (None) has_more means we cannot confirm completion;
             # treat it as continued pagination unless we hit another stop condition.
+            if page_was_truncated:
+                safe_print(f"      [W{worker_id}][LIMITE] Página parcialmente retenida; cursor no avanzado")
+                break
+
             if has_more is False:
                 naturally_completed = True
                 safe_print(f"      [W{worker_id}][FIN] No hay más comentarios")
                 break
 
-            cursor = next_cursor
+            cursor = checkpoint_cursor
 
         else:
             # API error or no response - treat as failure
