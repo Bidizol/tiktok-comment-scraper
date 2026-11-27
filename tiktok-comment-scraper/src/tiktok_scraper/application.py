@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import uuid
 
 from .config import ConfigurationError, load_settings
 from .observability import DiagnosticRecorder, configure_logging
@@ -38,10 +39,13 @@ def main(argv: list[str] | None = None) -> int:
 
     logger = configure_logging(settings.log_dir, settings.log_level)
     recorder = DiagnosticRecorder(settings.report_dir)
-    logger.info(
-        "Application startup",
-        extra={"component": "application", "operation": "startup"},
-    )
+    run_id = str(uuid.uuid4())
+    startup_context = {
+        "run_id": run_id,
+        "component": "application",
+        "operation": "startup",
+    }
+    logger.info("Application startup", extra=startup_context)
 
     checks = collect_startup_diagnostics(settings)
     for check in checks:
@@ -53,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
             check.name,
             check.detail,
             extra={
+                "run_id": run_id,
                 "component": "startup",
                 "operation": "diagnostics",
             },
@@ -69,13 +74,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         logger.critical(
             "Startup blocked by failed prerequisite",
-            extra={"component": "application", "operation": "startup"},
+            extra=startup_context,
         )
         return 1
 
     logger.info(
         "Foundation initialized; scraping engine integration is scheduled for a later phase",
-        extra={"component": "application", "operation": "startup"},
+        extra=startup_context,
     )
     return 0
 

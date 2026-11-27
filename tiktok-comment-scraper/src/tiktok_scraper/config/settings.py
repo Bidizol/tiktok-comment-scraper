@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -105,8 +106,8 @@ class Settings:
                 raise ConfigurationError("PROXY_URL contains an invalid port") from exc
         if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ConfigurationError("LOG_LEVEL is not a supported severity")
-        if self.request_timeout_seconds <= 0:
-            raise ConfigurationError("REQUEST_TIMEOUT_SECONDS must be positive")
+        if not math.isfinite(self.request_timeout_seconds) or self.request_timeout_seconds <= 0:
+            raise ConfigurationError("REQUEST_TIMEOUT_SECONDS must be a finite positive number")
 
     @classmethod
     def from_environment(

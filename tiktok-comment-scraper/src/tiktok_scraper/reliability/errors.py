@@ -115,6 +115,14 @@ class ErrorRecord:
             raise ValueError("component and operation are required")
         if not self.run_id.strip():
             raise ValueError("run_id is required")
+        if self.worker_id is not None and self.worker_id < 0:
+            raise ValueError("worker_id cannot be negative")
+        if self.batch_number is not None and self.batch_number < 0:
+            raise ValueError("batch_number cannot be negative")
+        if self.retry_attempt is not None and self.retry_attempt < 0:
+            raise ValueError("retry_attempt cannot be negative")
+        if self.http_status is not None and not 100 <= self.http_status <= 599:
+            raise ValueError("http_status must be between 100 and 599")
         parsed = datetime.fromisoformat(self.timestamp_utc.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             raise ValueError("timestamp_utc must include a timezone")
