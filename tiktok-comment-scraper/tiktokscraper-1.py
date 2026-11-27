@@ -618,7 +618,7 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
             max_comments=remaining_comments,
             transport=transport,
             retry_budget=recovery_budget,
-            stop_event=stop_event,
+            stop_event=run_control.stop_event,
         )
         pagination_result = paginator.run(
             initial_cursor=cursor,
@@ -730,8 +730,9 @@ def main() -> int:
     safe_print(f"CSV: {outputs['csv_path']}")
     safe_print(f"Summary: {outputs['summary_path']}")
     if run_result.get("interrupted"):
-        safe_print(f"Run stopped: {run_result.get('stop_reason')}")
-        return 130
+        stop_reason = run_result.get("stop_reason")
+        safe_print(f"Run stopped: {stop_reason}")
+        return 130 if stop_reason == "keyboard_interrupt" else 2
     return 0 if all(item.get("status") == "completed" for item in run_result["results"]) else 2
 
 

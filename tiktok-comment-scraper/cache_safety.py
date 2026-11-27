@@ -184,9 +184,11 @@ def scraper_run_lock(cache_dir: Path, timeout: float = 0.0):
         finally:
             _os_unlock(descriptor)
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        _RUN_LOCK.release()
+        try:
+            if descriptor is not None:
+                os.close(descriptor)
+        finally:
+            _RUN_LOCK.release()
 
 
 @contextmanager
