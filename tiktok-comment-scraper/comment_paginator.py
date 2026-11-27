@@ -312,11 +312,11 @@ class CommentPaginator:
                         if stop_reason == "keyboard_interrupt":
                             return self._finish(
                                 PaginatorOutcome.INTERRUPTED, PaginationState.INTERRUPTED,
-                                stop_reason, malformed_records,
+                                stop_reason, malformed=malformed_records,
                             )
                         return self._finish(
                             PaginatorOutcome.TRUNCATED_LIMIT, PaginationState.TRUNCATED_LIMIT,
-                            stop_reason, malformed_records,
+                            stop_reason, malformed=malformed_records,
                         )
                     except Exception as callback_error:
                         return self._finish(

@@ -704,7 +704,12 @@ def main() -> int:
         safe_print("No video jobs are configured; nothing was started.")
         return 2
     from config import MAX_RUN_COMMENTS
-    run_control = RunControl(max_comments=MAX_RUN_COMMENTS)
+    try:
+        run_control = RunControl(max_comments=MAX_RUN_COMMENTS)
+    except ValueError as error:
+        logger.error("Invalid run resource configuration (%s)", type(error).__name__)
+        safe_print(f"Invalid run resource configuration: {type(error).__name__}")
+        return 2
     previous_sigint_handler = signal.getsignal(signal.SIGINT)
 
     def request_graceful_stop(signum, frame):
