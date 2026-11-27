@@ -1,12 +1,8 @@
 name: Python tests
 
+# Deliberately manual only. Automated validation is deferred until Phase 10
+# is implemented and the user explicitly authorizes the complete test pass.
 on:
-  push:
-    branches:
-      - repo-sanity-cleanup
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
 
 jobs:
