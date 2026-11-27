@@ -46,8 +46,9 @@ Malformed source records are retained in restricted JSONL files under `cache/qua
 The versioned scraper reads settings from environment variables and the project `.env` file. Process environment values take precedence. Common settings include:
 
 - `TEST_VIDEO_ID` and `TEST_VIDEO_AUTHOR`
-- `MAX_WORKERS`
-- `MAX_COMMENTS`
+- `MAX_WORKERS` (1–16 workers; at most twice the worker count is queued)
+- `MAX_COMMENTS` (per video)
+- `MAX_RUN_COMMENTS` (run-level new-collection budget; defaults to 100,000; existing completed checkpoints are preserved even if they exceed the remaining budget)
 - `PROXY_MODE`, proxy endpoint and credentials
 - HTTP connection, read and total timeouts
 
@@ -61,7 +62,7 @@ From this directory:
 python tiktokscraper-1.py
 ```
 
-The entry point reads the configured video list, processes videos independently, and writes the run-scoped JSON, CSV and summary files.
+The entry point reads the configured video list, processes videos independently, and writes the run-scoped JSON, CSV and summary files. A run accepts at most 1,000 jobs and permits only one active scraper process per project cache. Ctrl+C requests a graceful stop: no new jobs are submitted, queued jobs are cancelled where possible, and active workers stop between pagination pages while preserving the last durable checkpoint.
 
 ## Checkpoints and recovery
 

@@ -26,6 +26,7 @@ SCHEMA_VERSION = 2
 PLATFORM = "tiktok"
 DEFAULT_DISK_SPACE_THRESHOLD = 500 * 1024 * 1024
 _LOCKS_GUARD = threading.Lock()
+_RUN_LOCK = threading.Lock()
 _THREAD_LOCKS: dict[int, threading.RLock] = {index: threading.RLock() for index in range(256)}
 _HELD_LOCKS = threading.local()
 
@@ -152,6 +153,40 @@ def release_path_lock(path: Path) -> None:
                 os.close(fd)
                 thread_lock.release()
             return
+
+
+@contextmanager
+def scraper_run_lock(cache_dir: Path, timeout: float = 0.0):
+    """Allow only one scraper run per cache root across threads and processes.
+
+    This lock deliberately uses a dedicated in-process mutex rather than the
+    checkpoint lock stripes: holding a run lock must never block a worker's
+    unrelated per-video lock because of a hash-stripe collision.
+    """
+    root = Path(cache_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".scraper-run.lock"
+    if not _RUN_LOCK.acquire(timeout=max(0.0, timeout)):
+        raise RuntimeError("Another scraper run already owns this project cache")
+    descriptor = None
+    acquired_os_lock = False
+    try:
+        descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+        acquired_os_lock = _os_lock(descriptor, time.monotonic() + max(0.0, timeout))
+        if not acquired_os_lock:
+            raise RuntimeError("Another process already owns this project cache")
+        try:
+            yield
+        finally:
+            _os_unlock(descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        _RUN_LOCK.release()
 
 
 @contextmanager

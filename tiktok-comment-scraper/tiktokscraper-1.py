@@ -8,7 +8,8 @@ import time
 import shutil
 from pathlib import Path
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import signal
 
 # Add the parent directory to path for imports
 # This allows importing from the tiktok_comment_scraper package
@@ -21,6 +22,7 @@ from proxy_manager import ProxyManager
 from retry import BoundedRetry, RetryPolicy, RetryRecord
 from coordinated_retry import CoordinatedRetryBudget, ErrorClassifier, AttemptRecord, make_classifier_for_operation, CoordinatedRetryContext
 from recovery_budget import RecoveryBudget
+from run_control import RunControl
 from diagnostics import DiagnosticsRecorder
 from comment_schema import normalize_comment_record, safe_source_payload
 from output_writer import write_run_outputs
@@ -31,6 +33,7 @@ from comment_paginator import (
     CommentPaginator,
     PaginatorResult,
     PaginatorOutcome,
+    PaginationStop,
     DEFAULT_MAX_BATCHES,
     DEFAULT_MAX_COMMENTS,
     DEFAULT_MAX_CONSECUTIVE_EMPTY,
@@ -45,7 +48,7 @@ from pagination_state import normalise_has_more, PaginationState, PaginationMeta
 sys.path.insert(0, str(Path(__file__).parent))
 from cache_safety import (
     save_and_load_cache_safe, cleanup_orphan_temp_files, load_cache_safe,
-    video_checkpoint_lock,
+    video_checkpoint_lock, scraper_run_lock,
 )  # noqa: E402
 
 # Configuration
@@ -259,15 +262,20 @@ def export_run_results(results: list, run_id: str | None = None, run_metadata: d
     return write_run_outputs(results, OUTPUT_DIR, run_id=run_id, run_metadata=run_metadata)
 
 
-def scrape_videos_and_export(video_jobs: list, max_workers: int = 3, run_id: str | None = None) -> dict:
-    """Scrape an explicit list of unique (video_id, author) jobs and export the run."""
+def scrape_videos_and_export(video_jobs: list, max_workers: int = 3, run_id: str | None = None, run_control: RunControl | None = None) -> dict:
+    """Run bounded video work with cooperative stop and isolated outcomes."""
     if not isinstance(video_jobs, list):
         raise TypeError("video_jobs must be a list")
-    if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
-        raise ValueError("max_workers must be a positive integer")
+    if isinstance(max_workers, bool) or not isinstance(max_workers, int) or not 1 <= max_workers <= 16:
+        raise ValueError("max_workers must be an integer between 1 and 16")
+    if isinstance(MAX_COMMENTS, bool) or not isinstance(MAX_COMMENTS, int) or not 1 <= MAX_COMMENTS <= 100_000:
+        raise ValueError("MAX_COMMENTS must be an integer between 1 and 100000")
+    if len(video_jobs) > 1000:
+        raise ValueError("A single run is limited to 1000 video jobs")
     run_id = run_id or str(uuid.uuid4())
     if not run_id or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for ch in run_id):
         raise ValueError("run_id contains unsafe path characters")
+
     normalized_jobs = []
     seen_video_ids = set()
     for job in video_jobs:
@@ -281,57 +289,110 @@ def scrape_videos_and_export(video_jobs: list, max_workers: int = 3, run_id: str
         seen_video_ids.add(video_id)
         normalized_jobs.append((video_id, author))
 
-    results_by_worker = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_job = {}
-        for job_index, (video_id, author) in enumerate(normalized_jobs):
-            worker_id = job_index + 1
-            future = executor.submit(scrape_video_comments, video_id, author, worker_id, run_id)
-            future_to_job[future] = (video_id, author, worker_id)
-        for future in as_completed(future_to_job):
-            video_id, author, worker_id = future_to_job[future]
-            try:
-                results_by_worker[worker_id] = future.result()
-            except Exception as error:
-                recovered_comments = []
-                recovery_error = None
-                try:
-                    recovered_cache = load_cache(worker_id, video_id)
-                    if recovered_cache:
-                        recovered_comments = [
-                            normalize_comment_record(video_id, item)
-                            for item in recovered_cache.get("comments", [])
-                        ]
-                except Exception as cache_error:
-                    recovery_error = type(cache_error).__name__
-                results_by_worker[worker_id] = {
-                    "video_id": video_id, "author": author, "worker_id": worker_id,
-                    "run_id": run_id, "total_comments": len(recovered_comments), "total_batches": 0,
-                    "status": "failed", "stop_reason": "unhandled_video_worker_exception",
-                    "error_code": getattr(error, "error_code", "UNEXPECTED_INTERNAL_ERROR"),
-                    "error_type": type(error).__name__, "cache_recovery_error": recovery_error,
-                    "comments": recovered_comments,
-                }
-    results = [
-        results_by_worker.get(index + 1, {
+    if run_control is None:
+        from config import MAX_RUN_COMMENTS
+        run_control = RunControl(max_comments=MAX_RUN_COMMENTS)
+    results_by_index = {}
+    next_index = 0
+    max_pending = max_workers * 2
+
+    def interrupted_result(index, reason):
+        video_id, author = normalized_jobs[index]
+        return {
             "video_id": video_id, "author": author, "worker_id": index + 1,
-            "run_id": run_id, "total_comments": 0, "status": "failed",
-            "stop_reason": "missing_worker_result", "comments": [],
-        })
-        for index, (video_id, author) in enumerate(normalized_jobs)
+            "run_id": run_id, "total_comments": 0, "total_batches": 0,
+            "status": "partial", "stop_reason": reason, "comments": [],
+        }
+
+    with scraper_run_lock(CACHE_DIR, timeout=0.0):
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="tiktok-video") as executor:
+            pending = {}
+
+            def submit_until_bounded():
+                nonlocal next_index
+                while (not run_control.is_stopped()
+                       and next_index < len(normalized_jobs)
+                       and len(pending) < max_pending):
+                    index = next_index
+                    next_index += 1
+                    video_id, author = normalized_jobs[index]
+                    future = executor.submit(
+                        scrape_video_comments, video_id, author, index + 1,
+                        run_id, run_control,
+                    )
+                    pending[future] = index
+
+            submit_until_bounded()
+            while pending:
+                completed, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+                for future in completed:
+                    index = pending.pop(future)
+                    if future.cancelled():
+                        results_by_index[index] = interrupted_result(index, "run_stopped_before_worker_start")
+                        continue
+                    try:
+                        results_by_index[index] = future.result()
+                    except Exception as error:
+                        video_id, author = normalized_jobs[index]
+                        recovered_comments = []
+                        recovery_error = None
+                        try:
+                            recovered_cache = load_cache(index + 1, video_id)
+                            if recovered_cache:
+                                recovered_comments = [
+                                    normalize_comment_record(video_id, item)
+                                    for item in recovered_cache.get("comments", [])
+                                ]
+                        except Exception as cache_error:
+                            recovery_error = type(cache_error).__name__
+                        results_by_index[index] = {
+                            "video_id": video_id, "author": author, "worker_id": index + 1,
+                            "run_id": run_id, "total_comments": len(recovered_comments), "total_batches": 0,
+                            "status": "failed", "stop_reason": "unhandled_video_worker_exception",
+                            "error_code": getattr(error, "error_code", "UNEXPECTED_INTERNAL_ERROR"),
+                            "error_type": type(error).__name__, "cache_recovery_error": recovery_error,
+                            "comments": recovered_comments,
+                        }
+
+                if run_control.is_stopped():
+                    for future, index in list(pending.items()):
+                        if future.cancel():
+                            pending.pop(future)
+                            results_by_index[index] = interrupted_result(index, "run_stopped_before_worker_start")
+                else:
+                    submit_until_bounded()
+
+    for index in range(next_index, len(normalized_jobs)):
+        results_by_index[index] = interrupted_result(index, "run_stopped_before_worker_start")
+
+    results = [
+        results_by_index.get(index, interrupted_result(index, "worker_result_unavailable"))
+        for index in range(len(normalized_jobs))
     ]
     outputs = export_run_results(
         results, run_id=run_id,
-        run_metadata={"max_workers": max_workers, "requested_video_jobs": len(normalized_jobs)},
+        run_metadata={
+            "max_workers": max_workers,
+            "max_pending_jobs": max_pending,
+            "requested_video_jobs": len(normalized_jobs),
+            "interrupted": run_control.is_stopped(),
+            "stop_reason": run_control.stop_reason,
+            "max_run_comments": run_control.max_comments,
+            "comments_reserved": run_control.comments_reserved,
+        },
     )
-    return {"run_id": run_id, "results": results, "outputs": outputs}
+    return {
+        "run_id": run_id, "results": results, "outputs": outputs,
+        "interrupted": run_control.is_stopped(), "stop_reason": run_control.stop_reason,
+    }
 
 
-def scrape_video_comments(video_id: str, video_author: str, worker_id: int, run_id: str | None = None) -> dict:
+def scrape_video_comments(video_id: str, video_author: str, worker_id: int, run_id: str | None = None, run_control: RunControl | None = None) -> dict:
     """Serialize ownership of a video's checkpoint across threads and processes."""
+    run_control = run_control or RunControl()
     try:
         with video_checkpoint_lock(CACHE_DIR, str(video_id), timeout=30.0):
-            return _scrape_video_comments_locked(video_id, video_author, worker_id, run_id=run_id)
+            return _scrape_video_comments_locked(video_id, video_author, worker_id, run_id=run_id, run_control=run_control)
     except TimeoutError as lock_error:
         return {
             "video_id": str(video_id), "author": video_author, "worker_id": worker_id,
@@ -347,7 +408,7 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int, run_
         }
 
 
-def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: int, run_id: str | None = None) -> dict:
+def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: int, run_id: str | None = None, run_control: RunControl | None = None) -> dict:
     """Scrape one video while holding its cross-process checkpoint lease."""
     from http_transport import HTTPTransport
     from config import (
@@ -356,6 +417,8 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
         HTTP_TOTAL_TIMEOUT_SECONDS, HTTP_MAX_RESPONSE_BYTES, HTTP_MAX_RETRIES,
     )
 
+    if isinstance(MAX_COMMENTS, bool) or not isinstance(MAX_COMMENTS, int) or not 1 <= MAX_COMMENTS <= 100_000:
+        raise ValueError("MAX_COMMENTS must be an integer between 1 and 100000")
     if PROXY_MODE == "disabled" and (PROXY_HOST or PROXY_PORT):
         raise ValueError("Proxy settings are present while PROXY_MODE is disabled")
     if PROXY_MODE not in {"disabled", "optional", "required"}:
@@ -391,8 +454,15 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
 
     cached = load_cache(worker_id, video_id)
     if cached and cached.get("is_complete", False):
-        # A completed checkpoint is immutable. Do not silently start over and
-        # replace its durable data when the same video appears in a later run.
+        # Completed checkpoint data is immutable and is included in the run
+        # output even when it exhausts the new-collection budget.
+        cached_comments = [
+            normalize_comment_record(video_id, item)
+            for item in cached.get("comments", [])
+        ]
+        if not run_control.reserve_comments(len(cached_comments)):
+            safe_print(f"[W{worker_id}] Existing completed checkpoint exceeds the remaining run comment budget.")
+        # A completed checkpoint is never truncated to satisfy a run-level cap.
         return {
             "video_id": video_id, "author": video_author, "worker_id": worker_id,
             "total_comments": len(cached.get("comments", [])),
@@ -405,10 +475,12 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
             "malformed_comments": [], "malformed_comments_path": None,
             "records_received": 0, "valid_comments": 0, "new_comments": 0,
             "normalization_anomalies": {},
-            "comments": [normalize_comment_record(video_id, item) for item in cached.get("comments", [])],
+            "comments": cached_comments,
         }
     if cached and not cached.get("is_complete", False):
         all_comments = [normalize_comment_record(video_id, item) for item in cached.get("comments", [])]
+        if not run_control.reserve_comments(len(all_comments)):
+            safe_print(f"[W{worker_id}] Run resource boundary reached before resuming this video.")
         seen_cids = set(cached.get("seen_cids", []))
         # Migrate legacy raw-ID dedup keys to the normalized key namespace.
         for existing_comment in all_comments:
@@ -472,6 +544,8 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
     normalization_anomalies = {"invalid_timestamp": 0, "invalid_like_count": 0, "invalid_reply_count": 0}
     def retain_comment(comment):
         nonlocal duplicates_skipped, invalid_missing_ids
+        if run_control.stop_event.is_set():
+            raise PaginationStop(run_control.stop_reason or "run_stop_requested")
         if not isinstance(comment, dict):
             invalid_missing_ids += 1
             return False
@@ -494,6 +568,8 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
                 or (legacy_id_key is not None and legacy_id_key in seen_cids)):
             duplicates_skipped += 1
             return False
+        if not run_control.reserve_comments(1):
+            raise PaginationStop(run_control.stop_reason or "run_comment_capacity_reached")
         if dedupe_key is not None:
             seen_cids.add(dedupe_key)
         all_comments.append(normalized)
@@ -542,6 +618,7 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
             max_comments=remaining_comments,
             transport=transport,
             retry_budget=recovery_budget,
+            stop_event=stop_event,
         )
         pagination_result = paginator.run(
             initial_cursor=cursor,
@@ -626,18 +703,35 @@ def main() -> int:
     if not TEST_VIDEOS:
         safe_print("No video jobs are configured; nothing was started.")
         return 2
+    from config import MAX_RUN_COMMENTS
+    run_control = RunControl(max_comments=MAX_RUN_COMMENTS)
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
+
+    def request_graceful_stop(signum, frame):
+        run_control.request_stop("keyboard_interrupt")
+
+    signal.signal(signal.SIGINT, request_graceful_stop)
     try:
-        run_result = scrape_videos_and_export(TEST_VIDEOS, max_workers=MAX_WORKERS)
+        run_result = scrape_videos_and_export(TEST_VIDEOS, max_workers=MAX_WORKERS, run_id=None, run_control=run_control)
+    except KeyboardInterrupt:
+        run_control.request_stop("keyboard_interrupt")
+        logger.warning("Run interrupted during shutdown")
+        return 130
     except Exception as error:
         logger.error("Scraper run could not produce its output artifacts (%s)", type(error).__name__)
         safe_print(f"Run failed: {type(error).__name__}")
         return 1
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
     outputs = run_result["outputs"]
     safe_print(f"Run ID: {run_result['run_id']}")
     safe_print(f"Videos: {outputs['total_videos']} | Comments: {outputs['total_comments']}")
     safe_print(f"JSON: {outputs['json_path']}")
     safe_print(f"CSV: {outputs['csv_path']}")
     safe_print(f"Summary: {outputs['summary_path']}")
+    if run_result.get("interrupted"):
+        safe_print(f"Run stopped: {run_result.get('stop_reason')}")
+        return 130
     return 0 if all(item.get("status") == "completed" for item in run_result["results"]) else 2
 
 

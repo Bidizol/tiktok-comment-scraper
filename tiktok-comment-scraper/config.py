@@ -104,6 +104,7 @@ SAVE_EVERY_N_BATCHES: int = int(os.environ.get("SAVE_EVERY_N_BATCHES", "5"))
 
 # Runtime configuration
 MAX_WORKERS: int = int(os.environ.get("MAX_WORKERS", "3"))
+MAX_RUN_COMMENTS: int = int(os.environ.get("MAX_RUN_COMMENTS", "100000"))
 
 # Output configuration
 OUTPUT_DIR: Path = BASE_DIR / "results"
@@ -168,10 +169,12 @@ def validate_config() -> list[str]:
         warnings.append("COMMENTS_PER_BATCH must be >= 1")
     if BATCHES_BEFORE_TOKEN_REFRESH < 1:
         warnings.append("BATCHES_BEFORE_TOKEN_REFRESH must be >= 1")
-    if MAX_COMMENTS < 1:
-        warnings.append("MAX_COMMENTS must be >= 1")
-    if MAX_WORKERS < 1:
-        warnings.append("MAX_WORKERS must be >= 1")
+    if MAX_COMMENTS < 1 or MAX_COMMENTS > 100_000:
+        warnings.append("MAX_COMMENTS must be between 1 and 100000")
+    if MAX_WORKERS < 1 or MAX_WORKERS > 16:
+        warnings.append("MAX_WORKERS must be between 1 and 16")
+    if MAX_RUN_COMMENTS < 1 or MAX_RUN_COMMENTS > 500_000:
+        warnings.append("MAX_RUN_COMMENTS must be between 1 and 500000")
     if SAVE_EVERY_N_BATCHES < 1:
         warnings.append("SAVE_EVERY_N_BATCHES must be >= 1")
 

@@ -41,6 +41,11 @@ DEFAULT_STALLED_TIMEOUT_SECONDS = 300
 DEFAULT_ELAPSED_TIMEOUT_SECONDS = 600
 MAX_CURSOR_VALUE = (2 ** 63) - 1
 
+
+class PaginationStop(Exception):
+    """A caller-requested resource boundary reached while processing a page."""
+
+
 # A comment may legitimately omit cid; text is sufficient to preserve it as a
 # comment record while the missing identifier is tracked independently.
 COMMENT_SCHEMA_KEYS = frozenset({
@@ -76,6 +81,7 @@ class CommentPaginator:
         stalled_timeout_seconds: int = DEFAULT_STALLED_TIMEOUT_SECONDS,
         elapsed_timeout_seconds: int = DEFAULT_ELAPSED_TIMEOUT_SECONDS,
         transport: Optional[HTTPTransport] = None, retry_budget: Any = None,
+        stop_event: Any = None,
     ):
         limits = {
             "max_batches": max_batches, "max_comments": max_comments,
@@ -105,6 +111,7 @@ class CommentPaginator:
         self.elapsed_timeout_seconds = float(elapsed_timeout_seconds)
         self.transport = transport or HTTPTransport()
         self.retry_budget = retry_budget
+        self.stop_event = stop_event
         self.cursor_checker = CursorIntegrityChecker(
             max_cycle_detections=max(5000, self.max_batches + 1),
             max_consecutive_empty=self.max_consecutive_empty,
@@ -159,6 +166,11 @@ class CommentPaginator:
 
         try:
             while True:
+                if self.stop_event is not None and self.stop_event.is_set():
+                    return self._finish(
+                        PaginatorOutcome.INTERRUPTED, PaginationState.INTERRUPTED,
+                        "run_stop_requested", malformed=malformed_records,
+                    )
                 if self.retry_budget is not None and not self.retry_budget.check_deadline():
                     reason = self.retry_budget.snapshot().get("exhausted_reason") or "recovery_budget_exhausted"
                     return self._finish(
@@ -295,6 +307,17 @@ class CommentPaginator:
                         missing_id_count += 1
                     try:
                         callback_result = on_comment(record) if on_comment is not None else True
+                    except PaginationStop as stop:
+                        stop_reason = str(stop) or "caller_resource_limit_reached"
+                        if stop_reason == "keyboard_interrupt":
+                            return self._finish(
+                                PaginatorOutcome.INTERRUPTED, PaginationState.INTERRUPTED,
+                                stop_reason, malformed_records,
+                            )
+                        return self._finish(
+                            PaginatorOutcome.TRUNCATED_LIMIT, PaginationState.TRUNCATED_LIMIT,
+                            stop_reason, malformed_records,
+                        )
                     except Exception as callback_error:
                         return self._finish(
                             PaginatorOutcome.FAILED_PERMANENT, PaginationState.FAILED_PERMANENT,
@@ -524,13 +547,14 @@ def paginate_comments(
     on_batch: Optional[Callable[[dict], Any]] = None,
     on_malformed_comment: Optional[Callable[[Any, str], Any]] = None,
     transport: Optional[HTTPTransport] = None, retry_budget: Any = None,
+    stop_event: Any = None,
 ) -> PaginatorResult:
     paginator = CommentPaginator(
         video_id=video_id, run_id=run_id, max_batches=max_batches,
         max_comments=max_comments, max_consecutive_empty=max_consecutive_empty,
         stalled_timeout_seconds=stalled_timeout_seconds,
         elapsed_timeout_seconds=elapsed_timeout_seconds, transport=transport,
-        retry_budget=retry_budget,
+        retry_budget=retry_budget, stop_event=stop_event,
     )
     return paginator.run(
         initial_cursor=initial_cursor, mstoken=mstoken,
