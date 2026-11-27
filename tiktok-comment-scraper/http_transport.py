@@ -116,8 +116,8 @@ class _TimeoutHTTPConnection(http.client.HTTPConnection):
         if self.sock is not None: self.sock.settimeout(self._read_timeout)
 
 class _TimeoutHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host, connect_timeout, read_timeout, context=None, check_hostname=None, **kwargs):
-        super().__init__(host, timeout=connect_timeout, context=context, check_hostname=check_hostname)
+    def __init__(self, host, connect_timeout, read_timeout, context=None, **kwargs):
+        super().__init__(host, timeout=connect_timeout, context=context)
         self._read_timeout=read_timeout
     def connect(self):
         super().connect()
@@ -134,8 +134,7 @@ class _TimeoutHTTPSHandler(urllib.request.HTTPSHandler):
         super().__init__(); self.connect_timeout=connect_timeout; self.read_timeout=read_timeout
     def https_open(self, request):
         return self.do_open(lambda host, **kw: _TimeoutHTTPSConnection(host,self.connect_timeout,self.read_timeout,
-            context=self._context,check_hostname=self._check_hostname),request,
-            context=self._context,check_hostname=self._check_hostname)
+            context=self._context),request,context=self._context)
 
 class HTTPTransport:
     """Thread-safe transport; each request owns its opener and response metadata.
