@@ -170,7 +170,7 @@ class CommentPaginator:
                     not isinstance(current_token, str)
                     or not current_token
                     or len(current_token) > 4096
-                    or any(character in current_token for character in "\\r\\n")
+                    or any(character in current_token for character in "\r\n")
                 ):
                     return self._finish(
                         PaginatorOutcome.FAILED, PaginationState.FAILED,

@@ -6,7 +6,7 @@ and response headers without shared mutable response state.
 """
 from __future__ import annotations
 import email.message, http.client, json, logging, math, random, socket, ssl, time
-import urllib.error, urllib.parse, urllib.request
+import urllib.error, urllib.parse, urllib.request, re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -69,7 +69,14 @@ def _validate_url(url: str):
 
 def _classify_exception(error: BaseException, proxy_enabled: bool):
     if isinstance(error, ssl.SSLError): return "TLS_ERROR", False
-    if isinstance(error, socket.gaierror): return ("PROXY_ERROR" if proxy_enabled else "DNS_ERROR"), True
+    if isinstance(error, socket.gaierror): return "DNS_ERROR", True
+    nested_reason = getattr(error, "reason", None)
+    if isinstance(nested_reason, ssl.SSLError): return "TLS_ERROR", False
+    if isinstance(nested_reason, socket.gaierror): return "DNS_ERROR", True
+    if proxy_enabled:
+        candidates = (getattr(error, "args", ()), getattr(nested_reason, "args", ()))
+        if any(re.search(r"\b407\b", str(part)) for group in candidates for part in group):
+            return "PROXY_AUTHENTICATION_ERROR", False
     if isinstance(error, (socket.timeout, TimeoutError)): return ("PROXY_ERROR" if proxy_enabled else "TIMEOUT_ERROR"), True
     if isinstance(error, ConnectionError): return ("PROXY_ERROR" if proxy_enabled else "NETWORK_ERROR"), True
     if isinstance(error, urllib.error.URLError):
@@ -111,7 +118,13 @@ class _TimeoutHTTPSHandler(urllib.request.HTTPSHandler):
             context=self._context,check_hostname=self._check_hostname)
 
 class HTTPTransport:
-    """Thread-safe transport; each request owns its opener and response metadata."""
+    """Thread-safe transport; each request owns its opener and response metadata.
+
+    Connect timeout bounds connection setup; read timeout bounds individual
+    socket reads; overall timeout is enforced while consuming the response body.
+    urllib's synchronous response-header parsing is still bounded by its socket
+    timeout rather than a strict end-to-end wall-clock deadline.
+    """
     def __init__(self, connect_timeout=DEFAULT_CONNECT_TIMEOUT, read_timeout=DEFAULT_READ_TIMEOUT,
                  overall_timeout=DEFAULT_TIMEOUT, proxy_url=None, *, proxy_required=False,
                  max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES, max_retries=3):

@@ -37,7 +37,10 @@ class ProxyManager:
         if bool(self.proxy_user)!=bool(self.proxy_pass): return False,"Both proxy username and password must be supplied together"
         if self.proxy_user is not None and (not self.proxy_user.strip() or not self.proxy_pass.strip()):
             return False,"Proxy credentials must not be blank"
-        host=f"[{self.proxy_host.strip('[]')}]" if ":" in self.proxy_host else self.proxy_host
+        normalized_host = self.proxy_host.strip("[]")
+        if ":" not in normalized_host:
+            normalized_host = normalized_host.encode("idna").decode("ascii")
+        host=f"[{normalized_host}]" if ":" in normalized_host else normalized_host
         credentials=(quote(self.proxy_user,safe="")+":"+quote(self.proxy_pass or "",safe="")+"@") if self.proxy_user is not None else ""
         self._url=f"http://{credentials}{host}:{port}"
         self._redacted_url=f"http://[REDACTED]@{host}:{port}" if credentials else f"http://{host}:{port}"
