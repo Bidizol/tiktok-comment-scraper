@@ -84,35 +84,29 @@ TEST_VIDEOS: list = [
 
 
 def validate_config() -> list[str]:
-    """Validate configuration values and return a list of warnings."""
+    """Validate loaded configuration and return actionable warnings.
+
+    This function deliberately does not assign to module-level settings:
+    validation must not create local-variable shadowing or pretend that an
+    invalid setting has been replaced when callers still read the original.
+    """
     warnings: list[str] = []
 
-    # Validate proxy configuration
     if (PROXY_HOST and not PROXY_PORT) or (PROXY_PORT and not PROXY_HOST):
         warnings.append(
             "PROXY_HOST and PROXY_PORT must both be set or both be unset"
         )
 
-    # Validate comment counts
     if COMMENTS_PER_BATCH < 1:
-        warnings.append("COMMENTS_PER_BATCH must be >= 1, using default 50")
-        COMMENTS_PER_BATCH = 50
-
+        warnings.append("COMMENTS_PER_BATCH must be >= 1")
     if BATCHES_BEFORE_TOKEN_REFRESH < 1:
-        warnings.append("BATCHES_BEFORE_TOKEN_REFRESH must be >= 1, using default 15")
-        BATCHES_BEFORE_TOKEN_REFRESH = 15
-
+        warnings.append("BATCHES_BEFORE_TOKEN_REFRESH must be >= 1")
     if MAX_COMMENTS < 1:
-        warnings.append("MAX_COMMENTS must be >= 1, using default 10000")
-        MAX_COMMENTS = 10000
-
+        warnings.append("MAX_COMMENTS must be >= 1")
     if MAX_WORKERS < 1:
-        warnings.append("MAX_WORKERS must be >= 1, using default 3")
-        MAX_WORKERS = 3
-
+        warnings.append("MAX_WORKERS must be >= 1")
     if SAVE_EVERY_N_BATCHES < 1:
-        warnings.append("SAVE_EVERY_N_BATCHES must be >= 1, using default 5")
-        SAVE_EVERY_N_BATCHES = 5
+        warnings.append("SAVE_EVERY_N_BATCHES must be >= 1")
 
     # Validate output directories are writable
     try:
