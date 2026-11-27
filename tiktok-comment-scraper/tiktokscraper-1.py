@@ -370,8 +370,21 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
     and comments list.
     """
     from http_transport import HTTPTransport
+    from config import PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS
 
-    transport = HTTPTransport()
+    # Validate proxy settings before the first network request. A partially
+    # configured proxy must fail closed rather than silently bypassing it.
+    proxy_manager = ProxyManager(
+        proxy_host=PROXY_HOST,
+        proxy_port=PROXY_PORT,
+        proxy_user=PROXY_USER or None,
+        proxy_pass=PROXY_PASS or None,
+    )
+    proxy_valid, proxy_error = proxy_manager.validate()
+    if not proxy_valid:
+        raise ValueError("Invalid proxy configuration: " + str(proxy_error))
+
+    transport = HTTPTransport(proxy_url=proxy_manager.proxy_url)
     token_manager = TokenManager(worker_id, transport=transport)
 
     # Attempt to load existing cache for resume
