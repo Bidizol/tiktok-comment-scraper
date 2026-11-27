@@ -75,12 +75,16 @@ class Settings:
     max_comments_per_video: int
     max_pages_per_video: int
     request_timeout_seconds: float
+    connect_timeout_seconds: float
+    read_timeout_seconds: float
+    max_response_bytes: int
+    max_http_retries: int
     minimum_free_bytes: int
     log_level: str
 
     def validate(self) -> None:
-        if self.http_backend not in {"urllib", "curl"}:
-            raise ConfigurationError("HTTP_BACKEND must be 'urllib' or 'curl'")
+        if self.http_backend != "urllib":
+            raise ConfigurationError("Only the urllib HTTP backend is currently supported")
         if self.proxy_mode not in {"disabled", "optional", "required"}:
             raise ConfigurationError(
                 "PROXY_MODE must be 'disabled', 'optional' or 'required'"
@@ -106,8 +110,13 @@ class Settings:
                 raise ConfigurationError("PROXY_URL contains an invalid port") from exc
         if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ConfigurationError("LOG_LEVEL is not a supported severity")
-        if not math.isfinite(self.request_timeout_seconds) or self.request_timeout_seconds <= 0:
-            raise ConfigurationError("REQUEST_TIMEOUT_SECONDS must be a finite positive number")
+        for name, value in (
+            ("REQUEST_TIMEOUT_SECONDS", self.request_timeout_seconds),
+            ("HTTP_CONNECT_TIMEOUT_SECONDS", self.connect_timeout_seconds),
+            ("HTTP_READ_TIMEOUT_SECONDS", self.read_timeout_seconds),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ConfigurationError(f"{name} must be a finite positive number")
 
     @classmethod
     def from_environment(
@@ -140,9 +149,11 @@ class Settings:
                 merged, "MAX_COMMENTS_PER_VIDEO", 10000, 1
             ),
             max_pages_per_video=_integer(merged, "MAX_PAGES_PER_VIDEO", 250, 1),
-            request_timeout_seconds=float(
-                merged.get("REQUEST_TIMEOUT_SECONDS", "30")
-            ),
+            request_timeout_seconds=float(merged.get("REQUEST_TIMEOUT_SECONDS", "30")),
+            connect_timeout_seconds=float(merged.get("HTTP_CONNECT_TIMEOUT_SECONDS", "15")),
+            read_timeout_seconds=float(merged.get("HTTP_READ_TIMEOUT_SECONDS", "20")),
+            max_response_bytes=_integer(merged, "HTTP_MAX_RESPONSE_BYTES", 5242880, 1024),
+            max_http_retries=_integer(merged, "HTTP_MAX_RETRIES", 3, 1),
             minimum_free_bytes=_integer(
                 merged, "MINIMUM_FREE_BYTES", 100 * 1024 * 1024, 0
             ),

@@ -122,8 +122,16 @@ class HTTPTransport:
             raise ValueError("max_response_bytes must be a positive integer")
         if proxy_required and not proxy_url: raise ValueError("A proxy is required but no proxy URL was configured")
         if proxy_url:
-            proxy=_validate_url(proxy_url)
-            if not proxy.port: raise ValueError("Proxy URL must include an explicit port")
+            proxy=urllib.parse.urlsplit(proxy_url)
+            if proxy.scheme.lower() not in {"http", "https"} or not proxy.hostname:
+                raise ValueError("Proxy URL must be an absolute HTTP(S) URL")
+            if proxy.path not in {"", "/"} or proxy.query or proxy.fragment:
+                raise ValueError("Proxy URL must not contain a path, query or fragment")
+            try:
+                if not proxy.port or not 1 <= proxy.port <= 65535:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError("Proxy URL must include a valid explicit port") from exc
         self.proxy_url=proxy_url; self.proxy_required=bool(proxy_required); self.max_response_bytes=max_response_bytes
 
     def request_detailed(self, method, url, *, headers=None, body=None, expect_json=True,
@@ -137,11 +145,12 @@ class HTTPTransport:
             if not isinstance(key,str) or not isinstance(value,str): raise TypeError("HTTP header names and values must be strings")
             if not key or any(c in key+value for c in "\r\n"): raise ValueError("HTTP headers must not contain CR/LF or empty names")
             clean[key]=value
-        connect=min(_positive_timeout(connect_timeout or self.connect_timeout,"connect_timeout"),
-                    _positive_timeout(overall_timeout or self.overall_timeout,"overall_timeout"))
-        read=min(_positive_timeout(read_timeout or self.read_timeout,"read_timeout"),
-                 _positive_timeout(overall_timeout or self.overall_timeout,"overall_timeout"))
-        total=_positive_timeout(overall_timeout or self.overall_timeout,"overall_timeout")
+        connect_value = self.connect_timeout if connect_timeout is None else connect_timeout
+        read_value = self.read_timeout if read_timeout is None else read_timeout
+        total_value = self.overall_timeout if overall_timeout is None else overall_timeout
+        total = _positive_timeout(total_value, "overall_timeout")
+        connect = min(_positive_timeout(connect_value, "connect_timeout"), total)
+        read = min(_positive_timeout(read_value, "read_timeout"), total)
         request=urllib.request.Request(url,data=body,headers=clean,method=method)
         proxy_map={"http":self.proxy_url,"https":self.proxy_url} if self.proxy_url else {}
         opener=urllib.request.build_opener(urllib.request.ProxyHandler(proxy_map),
@@ -205,7 +214,10 @@ class HTTPTransport:
                            maximum_attempts=3, max_backoff_seconds=30.0):
         if method.upper() not in {"GET","HEAD"} or body is not None:
             raise ValueError("Automatic retries are restricted to idempotent GET/HEAD requests")
-        if isinstance(maximum_attempts,bool) or maximum_attempts<1: raise ValueError("maximum_attempts must be positive")
+        if isinstance(maximum_attempts,bool) or not isinstance(maximum_attempts,int) or maximum_attempts<1:
+            raise ValueError("maximum_attempts must be a positive integer")
+        if not math.isfinite(max_backoff_seconds) or max_backoff_seconds < 0:
+            raise ValueError("max_backoff_seconds must be finite and non-negative")
         last=None
         for attempt in range(1,maximum_attempts+1):
             try:
