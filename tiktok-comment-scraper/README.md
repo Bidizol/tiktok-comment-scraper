@@ -1,78 +1,72 @@
-# TikTok Scraper
+# TikTok Comment Scraper
 
-![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)
-![Performance](https://img.shields.io/badge/Speed-667%20comments%2Fmin-brightgreen?style=flat-square)
-![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
+Python 3.10+ scraper with bounded pagination, resumable per-video checkpoints, normalized comment records, and run-scoped JSON/CSV exports.
 
-> High-performance TikTok comment scraper capable of extracting **667 comments per minute** using a hybrid API + scraping approach.
+## Current output
 
-## Overview
+Each invocation of the versioned scraper entry point creates a unique directory:
 
-Extracts comments from TikTok videos at scale. Uses a hybrid approach combining TikTok's internal API endpoints with web scraping techniques to achieve high throughput while maintaining session stability.
-
-## Features
-
-- **667 comments/minute** extraction speed
-- **Hybrid approach** — API endpoints + web scraping fallback
-- **Session management** — Automatic cookie refresh and rotation
-- **Structured output** — JSON and CSV export
-- **Rate limiting** — Configurable delays to avoid detection
-- **Pagination** — Handles cursor-based pagination automatically
-
-## Output Format
-
-Exports to both JSON and CSV with fields including:
-- Comment text and timestamp
-- Author username and ID
-- Like count
-- Reply count
-- Parent comment reference (for threaded replies)
-
-## Tech Stack
-
-![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white)
-
-- **Python 3.10+**
-- **requests/httpx** — HTTP client with session management
-- **JSON/CSV** — Dual output format
-
-## Installation
-
-```bash
-git clone https://github.com/Edioff/tiktokscraper.git
-cd tiktokscraper
-pip install -r requirements.txt
+```text
+results/
+  run_<run_id>/
+    comments.json
+    comments.csv
+    summary.json
 ```
 
-## Usage
+- `comments.json` contains run metadata and normalized comments, including a sanitized `source_payload` for source-field traceability.
+- `comments.csv` contains the stable normalized columns and protects spreadsheet-imported text fields against formula injection.
+- `summary.json` contains per-video outcomes and aggregate counts for records received, accepted comments, duplicates, missing IDs, malformed records, and successful pages.
+- Each run writes to a new directory. Existing run output is not overwritten.
+- Files are written through same-directory temporary files and atomic replacement. The run summary is written last and acts as the output-set completion marker.
+
+## Normalized comment fields
+
+The stable record includes:
+
+| Field | Meaning |
+|---|---|
+| `platform`, `video_id` | Source platform and video identity |
+| `comment_id` | Stable source comment ID, or null when absent |
+| `user_id`, `username`, `nickname` | Available author identity fields |
+| `text` | Comment text, preserved as Unicode |
+| `likes`, `reply_count` | Non-negative integer counts, otherwise null |
+| `created_at_epoch`, `created_at_utc` | UTC timestamp fields, or null when unavailable/invalid |
+| `parent_comment_id`, `is_reply` | Reply relationship |
+| `collected_at_utc` | Collection timestamp |
+| `dedupe_key` | Source ID key or stable missing-ID fingerprint |
+| `source_payload` | Sanitized source fields retained for traceability |
+
+Missing comment IDs do not cause a comment to be discarded. When a usable timestamp exists, a deterministic fingerprint is used for deduplication. This is a heuristic: two genuinely distinct comments with identical author, text, timestamp and parent may share a fingerprint. Records without a usable timestamp are retained without fingerprint-based deduplication.
+
+Malformed source records are retained in restricted JSONL files under `cache/quarantine/`; they are not silently converted into empty comments.
+
+## Configuration
+
+The versioned scraper reads settings from environment variables and the project `.env` file. Process environment values take precedence. Common settings include:
+
+- `TEST_VIDEO_ID` and `TEST_VIDEO_AUTHOR`
+- `MAX_WORKERS`
+- `MAX_COMMENTS`
+- `PROXY_MODE`, proxy endpoint and credentials
+- HTTP connection, read and total timeouts
+
+Start from `.env.example`. Do not commit real credentials or paste them into issue reports.
+
+## Run
+
+From this directory:
 
 ```bash
-python tiktokscraper.py
+python tiktokscraper-1.py
 ```
 
-Configure target videos and output settings in the script.
+The entry point reads the configured video list, processes videos independently, and writes the run-scoped JSON, CSV and summary files.
 
-## Performance
+## Checkpoints and recovery
 
-| Metric | Value |
-|--------|-------|
-| Extraction speed | **667 comments/minute** |
-| Output formats | JSON, CSV |
-| Pagination | Automatic cursor-based |
-| Session recovery | Automatic |
+Per-video checkpoints are stored under `cache/`. They contain a versioned schema, a SHA-256 integrity checksum, pagination position and normalized comment records. Corrupt or mismatched checkpoint files are preserved in quarantine. The immediately previous valid checkpoint is retained for recovery.
 
-## Notes
+## Scope and limitations
 
-- For educational and research purposes
-- Respect TikTok's Terms of Service and rate limits
-- Requires valid session cookies for API access
-
-## Author
-
-**Johan Cruz** — Data Engineer & Web Scraping Specialist
-- GitHub: [@Edioff](https://github.com/Edioff)
-- Available for freelance projects
-
-## License
-
-MIT
+TikTok's internal API is not a stable public contract. Response schema or access changes may require adapter updates. Missing timestamps remain null; the scraper does not invent dates. Missing-ID fingerprints are heuristic and cannot guarantee semantic identity.

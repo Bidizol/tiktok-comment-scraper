@@ -28,6 +28,10 @@ scraper_comments.csv
 .idea/
 .vscode/
 
+# Run-scoped exports and error reports
+/results/
+/error_reports/
+
 # New application runtime data
 /data/
 /reports/

@@ -22,6 +22,8 @@ from retry import BoundedRetry, RetryPolicy, RetryRecord
 from coordinated_retry import CoordinatedRetryBudget, ErrorClassifier, AttemptRecord, make_classifier_for_operation, CoordinatedRetryContext
 from recovery_budget import RecoveryBudget
 from diagnostics import DiagnosticsRecorder
+from comment_schema import normalize_comment_record, safe_source_payload
+from output_writer import write_run_outputs
 
 from errors.model import ScraperError, ErrorSeverity, ErrorOutcome
 
@@ -49,7 +51,8 @@ from cache_safety import (
 # Configuration
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 MAX_RETRIES = 3
-MAX_COMMENTS = 10000
+from config import MAX_COMMENTS as CONFIG_MAX_COMMENTS
+MAX_COMMENTS = CONFIG_MAX_COMMENTS
 COMMENTS_PER_BATCH = 50
 
 # Cache version for backward compatibility
@@ -79,11 +82,6 @@ print_lock = threading.Lock()
 def safe_print(message):
     with print_lock:
         print(message)
-
-# Videos de prueba
-TEST_VIDEOS = [
-    ("7676572010415230221", "erickie20"),
-]
 
 def validate_cache_data(cached: dict, video_id: str) -> tuple:
     """Validate without silently dropping any previously collected records.
@@ -255,11 +253,85 @@ def save_cache(worker_id: int, video_id: str, comments: list, seen_cids: set, ba
     return saved_path
 
 
-def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> dict:
+def export_run_results(results: list, run_id: str | None = None, run_metadata: dict | None = None) -> dict:
+    """Create immutable JSON/CSV/summary artifacts for one completed scraper run."""
+    from config import OUTPUT_DIR
+    return write_run_outputs(results, OUTPUT_DIR, run_id=run_id, run_metadata=run_metadata)
+
+
+def scrape_videos_and_export(video_jobs: list, max_workers: int = 3, run_id: str | None = None) -> dict:
+    """Scrape an explicit list of unique (video_id, author) jobs and export the run."""
+    if not isinstance(video_jobs, list):
+        raise TypeError("video_jobs must be a list")
+    if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
+        raise ValueError("max_workers must be a positive integer")
+    run_id = run_id or str(uuid.uuid4())
+    if not run_id or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for ch in run_id):
+        raise ValueError("run_id contains unsafe path characters")
+    normalized_jobs = []
+    seen_video_ids = set()
+    for job in video_jobs:
+        if not isinstance(job, (tuple, list)) or len(job) != 2:
+            raise ValueError("Each video job must be a (video_id, author) pair")
+        video_id, author = str(job[0]).strip(), str(job[1]).strip()
+        if not video_id.isdigit() or not 1 <= len(video_id) <= 32:
+            raise ValueError("Each video_id must contain 1-32 decimal digits")
+        if video_id in seen_video_ids:
+            raise ValueError("Duplicate video_id in one run: " + video_id)
+        seen_video_ids.add(video_id)
+        normalized_jobs.append((video_id, author))
+
+    results_by_worker = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_job = {}
+        for job_index, (video_id, author) in enumerate(normalized_jobs):
+            worker_id = job_index + 1
+            future = executor.submit(scrape_video_comments, video_id, author, worker_id, run_id)
+            future_to_job[future] = (video_id, author, worker_id)
+        for future in as_completed(future_to_job):
+            video_id, author, worker_id = future_to_job[future]
+            try:
+                results_by_worker[worker_id] = future.result()
+            except Exception as error:
+                recovered_comments = []
+                recovery_error = None
+                try:
+                    recovered_cache = load_cache(worker_id, video_id)
+                    if recovered_cache:
+                        recovered_comments = [
+                            normalize_comment_record(video_id, item)
+                            for item in recovered_cache.get("comments", [])
+                        ]
+                except Exception as cache_error:
+                    recovery_error = type(cache_error).__name__
+                results_by_worker[worker_id] = {
+                    "video_id": video_id, "author": author, "worker_id": worker_id,
+                    "run_id": run_id, "total_comments": len(recovered_comments), "total_batches": 0,
+                    "status": "failed", "stop_reason": "unhandled_video_worker_exception",
+                    "error_code": getattr(error, "error_code", "UNEXPECTED_INTERNAL_ERROR"),
+                    "error_type": type(error).__name__, "cache_recovery_error": recovery_error,
+                    "comments": recovered_comments,
+                }
+    results = [
+        results_by_worker.get(index + 1, {
+            "video_id": video_id, "author": author, "worker_id": index + 1,
+            "run_id": run_id, "total_comments": 0, "status": "failed",
+            "stop_reason": "missing_worker_result", "comments": [],
+        })
+        for index, (video_id, author) in enumerate(normalized_jobs)
+    ]
+    outputs = export_run_results(
+        results, run_id=run_id,
+        run_metadata={"max_workers": max_workers, "requested_video_jobs": len(normalized_jobs)},
+    )
+    return {"run_id": run_id, "results": results, "outputs": outputs}
+
+
+def scrape_video_comments(video_id: str, video_author: str, worker_id: int, run_id: str | None = None) -> dict:
     """Serialize ownership of a video's checkpoint across threads and processes."""
     try:
         with video_checkpoint_lock(CACHE_DIR, str(video_id), timeout=30.0):
-            return _scrape_video_comments_locked(video_id, video_author, worker_id)
+            return _scrape_video_comments_locked(video_id, video_author, worker_id, run_id=run_id)
     except TimeoutError as lock_error:
         return {
             "video_id": str(video_id), "author": video_author, "worker_id": worker_id,
@@ -268,11 +340,14 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
             "status": "partial", "stop_reason": "video_checkpoint_lock_unavailable",
             "cache_errors": [str(lock_error)], "pagination_outcome": "LOCKED",
             "pagination_metrics": {}, "recovery_budget": {},
-            "malformed_comments": [], "malformed_comments_path": None, "comments": [],
+            "malformed_comments": [], "malformed_comments_path": None,
+            "records_received": 0, "valid_comments": 0, "new_comments": 0,
+            "normalization_anomalies": {},
+            "comments": [],
         }
 
 
-def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: int) -> dict:
+def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: int, run_id: str | None = None) -> dict:
     """Scrape one video while holding its cross-process checkpoint lease."""
     from http_transport import HTTPTransport
     from config import (
@@ -305,7 +380,7 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
         max_response_bytes=HTTP_MAX_RESPONSE_BYTES,
         max_retries=HTTP_MAX_RETRIES,
     )
-    run_id = str(uuid.uuid4())
+    run_id = run_id or str(uuid.uuid4())
     recovery_budget = RecoveryBudget(
         video_id=str(video_id), run_id=run_id, worker_id=worker_id,
         maximum_retries=12, maximum_elapsed_seconds=DEFAULT_ELAPSED_TIMEOUT_SECONDS,
@@ -328,11 +403,17 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
             "cache_errors": [], "pagination_outcome": "COMPLETE",
             "pagination_metrics": {}, "recovery_budget": recovery_budget.snapshot(),
             "malformed_comments": [], "malformed_comments_path": None,
-            "comments": list(cached.get("comments", [])),
+            "records_received": 0, "valid_comments": 0, "new_comments": 0,
+            "normalization_anomalies": {},
+            "comments": [normalize_comment_record(video_id, item) for item in cached.get("comments", [])],
         }
     if cached and not cached.get("is_complete", False):
-        all_comments = list(cached.get("comments", []))
+        all_comments = [normalize_comment_record(video_id, item) for item in cached.get("comments", [])]
         seen_cids = set(cached.get("seen_cids", []))
+        # Migrate legacy raw-ID dedup keys to the normalized key namespace.
+        for existing_comment in all_comments:
+            if existing_comment.get("dedupe_key"):
+                seen_cids.add(existing_comment["dedupe_key"])
         cursor = cached.get("cursor", 0)
         base_batch_number = int(cached.get("batch_number", 0))
         safe_print(
@@ -366,7 +447,7 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
             "video_id": video_id,
             "worker_id": worker_id,
             "reason": reason,
-            "record": record,
+            "record": safe_source_payload(record),
         }
         encoded = (json.dumps(entry, ensure_ascii=False, default=str) + "\n").encode("utf-8")
         descriptor = os.open(
@@ -388,30 +469,34 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
                 pass
             raise
 
-    def normalize_cid(cid):
-        if cid is None or isinstance(cid, bool):
-            return None
-        if isinstance(cid, int):
-            return str(cid)
-        if isinstance(cid, str) and cid.strip():
-            return cid.strip()
-        return None
-
+    normalization_anomalies = {"invalid_timestamp": 0, "invalid_like_count": 0, "invalid_reply_count": 0}
     def retain_comment(comment):
         nonlocal duplicates_skipped, invalid_missing_ids
         if not isinstance(comment, dict):
             invalid_missing_ids += 1
             return False
-        cid = normalize_cid(comment.get("cid"))
-        if cid is None:
+        normalized = normalize_comment_record(video_id, comment)
+        if normalized["comment_id"] is None:
             invalid_missing_ids += 1
-            all_comments.append(comment)
-            return True
-        if cid in seen_cids:
+        raw_timestamp = comment.get("create_time", comment.get("createTime"))
+        raw_likes = comment.get("digg_count", comment.get("like_count"))
+        raw_replies = comment.get("reply_comment_total", comment.get("reply_count"))
+        if normalized["created_at_epoch"] is None and raw_timestamp is not None:
+            normalization_anomalies["invalid_timestamp"] += 1
+        if normalized["likes"] is None and raw_likes is not None:
+            normalization_anomalies["invalid_like_count"] += 1
+        if normalized["reply_count"] is None and raw_replies is not None:
+            normalization_anomalies["invalid_reply_count"] += 1
+        dedupe_key = normalized.get("dedupe_key")
+        legacy_id_key = normalized.get("comment_id")
+        if dedupe_key is not None and (
+                dedupe_key in seen_cids
+                or (legacy_id_key is not None and legacy_id_key in seen_cids)):
             duplicates_skipped += 1
             return False
-        seen_cids.add(cid)
-        all_comments.append(comment)
+        if dedupe_key is not None:
+            seen_cids.add(dedupe_key)
+        all_comments.append(normalized)
         return True
 
     def persist_batch(batch_info):
@@ -427,6 +512,9 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
             batch_number=candidate_batch,
             cursor=candidate_cursor,
             is_final=False,
+            completion_state="IN_PROGRESS",
+            stop_reason=batch_info.get("stop_reason"),
+            run_id=run_id,
         )
         if save_error:
             cache_errors.append(str(save_error))
@@ -486,6 +574,9 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
         batch_number=last_checkpoint_batch,
         cursor=last_checkpoint_cursor,
         is_final=naturally_completed,
+        completion_state="COMPLETE" if naturally_completed else "IN_PROGRESS",
+        stop_reason=stop_reason,
+        run_id=run_id,
     )
     if save_error:
         cache_errors.append(str(save_error))
@@ -503,6 +594,10 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
         "proxy_rotations": 0,
         "duplicates_skipped": duplicates_skipped,
         "invalid_missing_ids": invalid_missing_ids,
+        "normalization_anomalies": dict(normalization_anomalies),
+        "records_received": pagination_result.metadata.records_received if pagination_result else 0,
+        "valid_comments": pagination_result.metadata.valid_comments_extracted if pagination_result else 0,
+        "new_comments": pagination_result.metadata.valid_comments_extracted if pagination_result else 0,
         "status": "completed" if naturally_completed else "partial",
         "stop_reason": stop_reason,
         "cache_errors": cache_errors,
@@ -522,3 +617,29 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
         f"{invalid_missing_ids} IDs inválidos/faltantes"
     )
     return result
+
+
+
+def main() -> int:
+    """Run the configured video list and create immutable run exports."""
+    from config import MAX_WORKERS, TEST_VIDEOS
+    if not TEST_VIDEOS:
+        safe_print("No video jobs are configured; nothing was started.")
+        return 2
+    try:
+        run_result = scrape_videos_and_export(TEST_VIDEOS, max_workers=MAX_WORKERS)
+    except Exception as error:
+        logger.error("Scraper run could not produce its output artifacts (%s)", type(error).__name__)
+        safe_print(f"Run failed: {type(error).__name__}")
+        return 1
+    outputs = run_result["outputs"]
+    safe_print(f"Run ID: {run_result['run_id']}")
+    safe_print(f"Videos: {outputs['total_videos']} | Comments: {outputs['total_comments']}")
+    safe_print(f"JSON: {outputs['json_path']}")
+    safe_print(f"CSV: {outputs['csv_path']}")
+    safe_print(f"Summary: {outputs['summary_path']}")
+    return 0 if all(item.get("status") == "completed" for item in run_result["results"]) else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

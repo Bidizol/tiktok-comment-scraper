@@ -307,7 +307,11 @@ class CommentPaginator:
                     else:
                         accepted += 1
 
-                records_received = len(retained)
+                # Count the full API page separately from records retained
+                # under the configured cap. A truncated page is revisited from
+                # the last durable cursor on resume.
+                records_received = len(comments)
+                records_retained = len(retained)
                 self.metadata = dataclasses.replace(
                     self.metadata,
                     requested_cursor=cursor,
@@ -355,6 +359,7 @@ class CommentPaginator:
                     "batch_number": self.metadata.batch_number,
                     "page_truncated": page_truncated,
                     "records_received": records_received,
+                    "records_retained": records_retained,
                     "valid_comments_extracted": accepted,
                     "duplicate_comments": duplicate_count,
                     "missing_comment_ids": missing_id_count,
