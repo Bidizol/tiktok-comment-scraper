@@ -9,6 +9,7 @@ the original baseline files.
 """
 import os
 from pathlib import Path
+from urllib.parse import quote
 
 # Base directory
 BASE_DIR = Path(__file__).parent
@@ -32,11 +33,14 @@ PROXY_PASS: str = os.environ.get("PROXY_PASS", "")
 def get_proxy_url() -> str:
     """Construct the proxy URL from component parts when needed."""
     if PROXY_HOST and PROXY_PORT:
-        user_part = f"{PROXY_USER}@" if PROXY_USER else ""
+        user_part = ""
+        if PROXY_USER:
+            credentials = quote(PROXY_USER, safe="")
+            if PROXY_PASS:
+                credentials += ":" + quote(PROXY_PASS, safe="")
+            user_part = credentials + "@"
         return f"http://{user_part}{PROXY_HOST}:{PROXY_PORT}"
     return ""
-
-PROXY_URL = property(get_proxy_url)
 
 # User agent string
 USER_AGENT: str = os.environ.get(
