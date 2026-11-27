@@ -55,9 +55,9 @@ class ScraperError(Exception):
 
     error_code: str
     severity: ErrorSeverity
-    timestamp_utc: str
     component: str
     function: str
+    timestamp_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     video_id: Optional[str] = None
     run_id: Optional[str] = None
     worker_id: Optional[int] = None
@@ -68,6 +68,19 @@ class ScraperError(Exception):
     recovery_action: Optional[str] = None
     outcome: ErrorOutcome = ErrorOutcome.FAILED_PERMANENT
     explanation: str = ""
+
+    def __post_init__(self) -> None:
+        """Normalize string enum values accepted by legacy call sites."""
+        if isinstance(self.severity, str):
+            try:
+                self.severity = ErrorSeverity[self.severity]
+            except KeyError:
+                self.severity = ErrorSeverity(self.severity)
+        if isinstance(self.outcome, str):
+            try:
+                self.outcome = ErrorOutcome[self.outcome]
+            except KeyError:
+                self.outcome = ErrorOutcome(self.outcome)
 
     def to_dict(self) -> dict:
         """Convert the error record to a dictionary for JSON serialization."""

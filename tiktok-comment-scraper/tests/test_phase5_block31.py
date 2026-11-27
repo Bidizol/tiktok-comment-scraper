@@ -61,14 +61,16 @@ def _write_cache(cache_dir, worker_id, video_id, comments, seen_cids, cursor, ba
 def _install_mock_transport(monkeypatch, responses):
     call_order = {"n": 0}
 
-    def fake_request(self, method, url, headers=None, body=None):
+    def fake_request(self, method, url, headers=None, body=None, **kwargs):
         idx = call_order["n"]
         call_order["n"] += 1
         if idx < len(responses):
             return responses[idx]
-        return (200, {"comments": [], "has_more": False, "next_cursor": 0, "http_status": 200, "error": None})
+        return (200, {"comments": [], "has_more": False, "cursor": 0, "http_status": 200, "error": None})
 
-    monkeypatch.setattr(http_transport.HTTPTransport, "request", fake_request)
+    monkeypatch.setattr(tiktokscraper_1.HTTPTransport, "request", fake_request)
+    # Token acquisition is not under test here; prevent any external request.
+    monkeypatch.setattr(tiktokscraper_1.TokenManager, "get_token", lambda self: "test-token")
     return call_order
 
 
@@ -224,7 +226,7 @@ class TestMissingAndMalformedCommentIds:
                     {"text": "also no cid"},
                 ],
                 "has_more": False,
-                "next_cursor": 50,
+                "cursor": 50,
                 "http_status": 200,
                 "error": None,
             }),
@@ -254,7 +256,7 @@ class TestMissingAndMalformedCommentIds:
                     {"cid": 3.5, "text": "float cid"},
                 ],
                 "has_more": False,
-                "next_cursor": 50,
+                "cursor": 50,
                 "http_status": 200,
                 "error": None,
             }),
@@ -278,7 +280,7 @@ class TestMissingAndMalformedCommentIds:
                     _make_comment(7),
                 ],
                 "has_more": False,
-                "next_cursor": 50,
+                "cursor": 50,
                 "http_status": 200,
                 "error": None,
             }),
@@ -300,7 +302,7 @@ class TestMissingAndMalformedCommentIds:
                     {"text": "no id b"},
                 ],
                 "has_more": False,
-                "next_cursor": 50,
+                "cursor": 50,
                 "http_status": 200,
                 "error": None,
             }),
@@ -326,7 +328,7 @@ class TestMissingAndMalformedCommentIds:
                     {"cid": "", "text": "empty"},
                 ],
                 "has_more": False,
-                "next_cursor": 50,
+                "cursor": 50,
                 "http_status": 200,
                 "error": None,
             }),
@@ -353,7 +355,7 @@ class TestResumeAndDuplicateIntegrity:
             (200, {
                 "comments": [_make_comment("1"), _make_comment("2")],
                 "has_more": True,
-                "next_cursor": 50,
+                "cursor": 50,
                 "http_status": 200,
                 "error": None,
             }),
@@ -375,7 +377,7 @@ class TestResumeAndDuplicateIntegrity:
             (200, {
                 "comments": [_make_comment("2"), _make_comment("3")],
                 "has_more": False,
-                "next_cursor": 100,
+                "cursor": 100,
                 "http_status": 200,
                 "error": None,
             }),
@@ -397,7 +399,7 @@ class TestResumeAndDuplicateIntegrity:
             (200, {
                 "comments": [_make_comment("1")],
                 "has_more": True,
-                "next_cursor": 50,
+                "cursor": 50,
                 "http_status": 200,
                 "error": None,
             }),
@@ -420,7 +422,7 @@ class TestResumeAndDuplicateIntegrity:
             (200, {
                 "comments": [_make_comment("1")],
                 "has_more": True,
-                "next_cursor": 50,
+                "cursor": 50,
                 "http_status": 200,
                 "error": None,
             }),
@@ -456,7 +458,7 @@ class TestCheckpointFrequency:
                 return (200, {
                     "comments": [_make_comment("1")],
                     "has_more": True,
-                    "next_cursor": 50,
+                    "cursor": 50,
                     "http_status": 200,
                     "error": None,
                 })
@@ -464,11 +466,11 @@ class TestCheckpointFrequency:
                 return (200, {
                     "comments": [_make_comment("2")],
                     "has_more": False,
-                    "next_cursor": 100,
+                    "cursor": 100,
                     "http_status": 200,
                     "error": None,
                 })
-            return (200, {"comments": [], "has_more": False, "next_cursor": 0, "http_status": 200, "error": None})
+            return (200, {"comments": [], "has_more": False, "cursor": 0, "http_status": 200, "error": None})
 
         monkeypatch.setattr(http_transport.HTTPTransport, "request", fake_request)
         scrape_video_comments("vid", "author", worker_id=1)
@@ -497,7 +499,7 @@ class TestMaxCommentsEnforcement:
             return (200, {
                 "comments": [_make_comment(str(call_count["n"] + 10)), _make_comment(str(call_count["n"] + 11))],
                 "has_more": True,
-                "next_cursor": 50 * call_count["n"],
+                "cursor": 50 * call_count["n"],
                 "http_status": 200,
                 "error": None,
             })
@@ -520,7 +522,7 @@ class TestMaxCommentsEnforcement:
             return (200, {
                 "comments": [_make_comment(str(i)) for i in range(call_count["n"] * 2 - 1, call_count["n"] * 2 + 1)],
                 "has_more": True,
-                "next_cursor": 50,
+                "cursor": 50,
                 "http_status": 200,
                 "error": None,
             })
@@ -543,7 +545,7 @@ class TestMaxCommentsEnforcement:
             (200, {
                 "comments": [_make_comment("1")],
                 "has_more": True,
-                "next_cursor": 50,
+                "cursor": 50,
                 "http_status": 200,
                 "error": None,
             }),

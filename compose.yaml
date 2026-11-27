@@ -1,0 +1,28 @@
+name: tiktok-comment-scraper
+
+services:
+  scraper:
+    build:
+      context: ./tiktok-comment-scraper
+      dockerfile: deploy/Dockerfile
+    env_file:
+      - ./tiktok-comment-scraper/.env
+    environment:
+      CACHE_DIR: /var/lib/tiktok-scraper/cache
+      OUTPUT_DIR: /var/lib/tiktok-scraper/results
+      ERROR_REPORT_DIR: /var/lib/tiktok-scraper/error_reports
+      DATABASE_PATH: /var/lib/tiktok-scraper/scraper.sqlite3
+    init: true
+    restart: "no"
+    stop_grace_period: 90s
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - scraper-data:/var/lib/tiktok-scraper
+
+volumes:
+  scraper-data:
+    name: tiktok-scraper-data

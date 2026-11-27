@@ -13,9 +13,8 @@ _tiktokscraper_1_spec = importlib.util.spec_from_file_location("tiktokscraper_1"
 _tiktokscraper_1 = importlib.util.module_from_spec(_tiktokscraper_1_spec)
 _tiktokscraper_1_spec.loader.exec_module(_tiktokscraper_1)
 
-# Load scrape_video_comments from tiktokscraper.py and assign it to the module
-from tiktokscraper import scrape_video_comments
-_tiktokscraper_1.scrape_video_comments = scrape_video_comments
+# Exercise the operational implementation loaded from tiktokscraper-1.py.
+scrape_video_comments = _tiktokscraper_1.scrape_video_comments
 
 
 class TestScrapeVideoCommentsIntegration:

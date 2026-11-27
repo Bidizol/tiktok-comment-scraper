@@ -9,6 +9,7 @@ the original baseline files.
 """
 import os
 from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
 
 # Base directory
 BASE_DIR = Path(__file__).parent
@@ -16,10 +17,24 @@ BASE_DIR = Path(__file__).parent
 # Load .env file from the project root if it exists
 ENV_PATH = BASE_DIR / ".env"
 if ENV_PATH.exists():
-    with open(ENV_PATH) as env_file:
+    with open(ENV_PATH, encoding="utf-8") as env_file:
         for env_line in env_file:
-            if '=' in env_line:
-                env_key, env_value = env_line.strip().split('=', 1)
+            line = env_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            env_key, env_value = line.split("=", 1)
+            env_key = env_key.strip()
+            if env_key.startswith("export "):
+                env_key = env_key[7:].strip()
+            if not env_key:
+                continue
+            env_value = env_value.strip()
+            if len(env_value) >= 2 and env_value[0] == env_value[-1] and env_value[0] in {"'", '"'}:
+                env_value = env_value[1:-1]
+            else:
+                env_value = env_value.split(" #", 1)[0].strip()
+            # Process environment always takes precedence over the .env file.
+            if env_key not in os.environ:
                 os.environ[env_key] = env_value
 
 # Proxy configuration
@@ -27,16 +42,52 @@ PROXY_HOST: str = os.environ.get("PROXY_HOST", "")
 PROXY_PORT: str = os.environ.get("PROXY_PORT", "")
 PROXY_USER: str = os.environ.get("PROXY_USER", "")
 PROXY_PASS: str = os.environ.get("PROXY_PASS", "")
+PROXY_URL: str = os.environ.get("PROXY_URL", "").strip()
+PROXY_MODE: str = os.environ.get("PROXY_MODE", "optional").strip().lower()
+if PROXY_URL and not (PROXY_HOST and PROXY_PORT):
+    _proxy_parts = urlsplit(PROXY_URL)
+    if (
+        _proxy_parts.scheme.lower() != "http"
+        or not _proxy_parts.hostname
+        or _proxy_parts.path not in {"", "/"}
+        or _proxy_parts.query
+        or _proxy_parts.fragment
+    ):
+        raise ValueError("PROXY_URL must be a valid HTTP proxy endpoint without a path or query")
+    try:
+        _proxy_port = _proxy_parts.port
+    except ValueError as exc:
+        raise ValueError("PROXY_URL contains an invalid port") from exc
+    if _proxy_port is None:
+        raise ValueError("PROXY_URL must include an explicit port")
+    if bool(_proxy_parts.username) != bool(_proxy_parts.password):
+        raise ValueError("PROXY_URL must include both username and password, or neither")
+    PROXY_HOST = _proxy_parts.hostname
+    PROXY_PORT = str(_proxy_port)
+    PROXY_USER = unquote(_proxy_parts.username or "")
+    PROXY_PASS = unquote(_proxy_parts.password or "")
+PROXY_REQUIRED: bool = (
+    PROXY_MODE == "required"
+    or os.environ.get("PROXY_REQUIRED", "0").strip().lower() in {"1", "true", "yes"}
+)
+HTTP_CONNECT_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_CONNECT_TIMEOUT_SECONDS", "15"))
+HTTP_READ_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_READ_TIMEOUT_SECONDS", "20"))
+HTTP_TOTAL_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_TOTAL_TIMEOUT_SECONDS", "30"))
+HTTP_MAX_RESPONSE_BYTES: int = int(os.environ.get("HTTP_MAX_RESPONSE_BYTES", str(5 * 1024 * 1024)))
+HTTP_MAX_RETRIES: int = int(os.environ.get("HTTP_MAX_RETRIES", "6"))
 
 # Derived proxy URL — constructed only when needed, never logged directly
 def get_proxy_url() -> str:
     """Construct the proxy URL from component parts when needed."""
     if PROXY_HOST and PROXY_PORT:
-        user_part = f"{PROXY_USER}@" if PROXY_USER else ""
+        user_part = ""
+        if PROXY_USER:
+            credentials = quote(PROXY_USER, safe="")
+            if PROXY_PASS:
+                credentials += ":" + quote(PROXY_PASS, safe="")
+            user_part = credentials + "@"
         return f"http://{user_part}{PROXY_HOST}:{PROXY_PORT}"
     return ""
-
-PROXY_URL = property(get_proxy_url)
 
 # User agent string
 USER_AGENT: str = os.environ.get(
@@ -53,30 +104,43 @@ SAVE_EVERY_N_BATCHES: int = int(os.environ.get("SAVE_EVERY_N_BATCHES", "5"))
 
 # Runtime configuration
 MAX_WORKERS: int = int(os.environ.get("MAX_WORKERS", "3"))
+MAX_RUN_COMMENTS: int = int(os.environ.get("MAX_RUN_COMMENTS", "100000"))
+MINIMUM_FREE_BYTES: int = int(os.environ.get("MINIMUM_FREE_BYTES", str(100 * 1024 * 1024)))
+DIAGNOSTICS_MAX_BYTES: int = int(os.environ.get("DIAGNOSTICS_MAX_BYTES", str(10 * 1024 * 1024)))
+DIAGNOSTICS_BACKUP_COUNT: int = int(os.environ.get("DIAGNOSTICS_BACKUP_COUNT", "5"))
 
-# Output configuration
-OUTPUT_DIR: Path = BASE_DIR / "results"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# Runtime storage locations. Relative paths resolve from this project directory;
+# absolute paths support persistent mounts and external data volumes.
+def _runtime_path(variable: str, default: str) -> Path:
+    configured = os.environ.get(variable, default).strip()
+    if not configured:
+        raise ValueError(f"{variable} cannot be empty")
+    candidate = Path(configured).expanduser()
+    if not candidate.is_absolute():
+        candidate = BASE_DIR / candidate
+    return candidate.resolve()
 
-# Cache configuration — transitioning from JSON cache to SQLite
-CACHE_DIR: Path = BASE_DIR / "cache"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Database configuration
-DATABASE_PATH: Path = BASE_DIR / "scraper.db"
+OUTPUT_DIR: Path = _runtime_path("OUTPUT_DIR", "results")
+CACHE_DIR: Path = _runtime_path("CACHE_DIR", "cache")
+DATABASE_PATH: Path = _runtime_path("DATABASE_PATH", "scraper.db")
+ERROR_REPORT_DIR: Path = _runtime_path("ERROR_REPORT_DIR", "error_reports")
 
-# Error reporting configuration
-ERROR_REPORT_DIR: Path = BASE_DIR / "error_reports"
-ERROR_REPORT_DIR.mkdir(parents=True, exist_ok=True)
+for _runtime_directory in (OUTPUT_DIR, CACHE_DIR, ERROR_REPORT_DIR, DATABASE_PATH.parent):
+    _runtime_directory.mkdir(parents=True, exist_ok=True)
 
 # Testing configuration
 TEST_MODE: bool = os.environ.get("TEST_MODE", "0") == "1"
 
-# Video configuration
-TEST_VIDEOS: list = [
-    (os.environ.get("TEST_VIDEO_ID", "7676572010415230221"),
-     os.environ.get("TEST_VIDEO_AUTHOR", "erickie20"))
-]
+# Video configuration. Never fall back to a baked-in example video.
+_configured_video_id = os.environ.get("TEST_VIDEO_ID", "").strip()
+_configured_video_author = os.environ.get("TEST_VIDEO_AUTHOR", "").strip()
+if bool(_configured_video_id) != bool(_configured_video_author):
+    raise ValueError("TEST_VIDEO_ID and TEST_VIDEO_AUTHOR must be configured together")
+TEST_VIDEOS: list = (
+    [(_configured_video_id, _configured_video_author)]
+    if _configured_video_id and _configured_video_author else []
+)
 
 # ---------------------------------------------------------------------------
 # Configuration validation
@@ -84,35 +148,53 @@ TEST_VIDEOS: list = [
 
 
 def validate_config() -> list[str]:
-    """Validate configuration values and return a list of warnings."""
+    """Validate loaded configuration and return actionable warnings.
+
+    This function deliberately does not assign to module-level settings:
+    validation must not create local-variable shadowing or pretend that an
+    invalid setting has been replaced when callers still read the original.
+    """
     warnings: list[str] = []
 
-    # Validate proxy configuration
     if (PROXY_HOST and not PROXY_PORT) or (PROXY_PORT and not PROXY_HOST):
         warnings.append(
             "PROXY_HOST and PROXY_PORT must both be set or both be unset"
         )
 
-    # Validate comment counts
+    for name, value in (
+        ("HTTP_CONNECT_TIMEOUT_SECONDS", HTTP_CONNECT_TIMEOUT_SECONDS),
+        ("HTTP_READ_TIMEOUT_SECONDS", HTTP_READ_TIMEOUT_SECONDS),
+        ("HTTP_TOTAL_TIMEOUT_SECONDS", HTTP_TOTAL_TIMEOUT_SECONDS),
+    ):
+        if not __import__("math").isfinite(value) or value <= 0:
+            warnings.append(f"{name} must be a finite positive number")
+    if HTTP_MAX_RESPONSE_BYTES < 1024 or HTTP_MAX_RESPONSE_BYTES > 50 * 1024 * 1024:
+        warnings.append("HTTP_MAX_RESPONSE_BYTES must be between 1024 and 52428800")
+    if HTTP_MAX_RETRIES < 1 or HTTP_MAX_RETRIES > 10:
+        warnings.append("HTTP_MAX_RETRIES must be between 1 and 10")
+    if PROXY_MODE not in {"disabled", "optional", "required"}:
+        warnings.append("PROXY_MODE must be disabled, optional or required")
+    if PROXY_REQUIRED and not (PROXY_HOST and PROXY_PORT):
+        warnings.append("PROXY_REQUIRED is enabled but no proxy endpoint is configured")
+
     if COMMENTS_PER_BATCH < 1:
-        warnings.append("COMMENTS_PER_BATCH must be >= 1, using default 50")
-        COMMENTS_PER_BATCH = 50
-
+        warnings.append("COMMENTS_PER_BATCH must be >= 1")
     if BATCHES_BEFORE_TOKEN_REFRESH < 1:
-        warnings.append("BATCHES_BEFORE_TOKEN_REFRESH must be >= 1, using default 15")
-        BATCHES_BEFORE_TOKEN_REFRESH = 15
-
-    if MAX_COMMENTS < 1:
-        warnings.append("MAX_COMMENTS must be >= 1, using default 10000")
-        MAX_COMMENTS = 10000
-
-    if MAX_WORKERS < 1:
-        warnings.append("MAX_WORKERS must be >= 1, using default 3")
-        MAX_WORKERS = 3
-
+        warnings.append("BATCHES_BEFORE_TOKEN_REFRESH must be >= 1")
+    if MAX_COMMENTS < 1 or MAX_COMMENTS > 100_000:
+        warnings.append("MAX_COMMENTS must be between 1 and 100000")
+    if MAX_WORKERS < 1 or MAX_WORKERS > 16:
+        warnings.append("MAX_WORKERS must be between 1 and 16")
+    if MAX_RUN_COMMENTS < 1 or MAX_RUN_COMMENTS > 500_000:
+        warnings.append("MAX_RUN_COMMENTS must be between 1 and 500000")
+    if DIAGNOSTICS_MAX_BYTES < 64 * 1024 or DIAGNOSTICS_MAX_BYTES > 100 * 1024 * 1024:
+        warnings.append("DIAGNOSTICS_MAX_BYTES must be between 65536 and 104857600")
+    if DIAGNOSTICS_BACKUP_COUNT < 1 or DIAGNOSTICS_BACKUP_COUNT > 20:
+        warnings.append("DIAGNOSTICS_BACKUP_COUNT must be between 1 and 20")
+    if MINIMUM_FREE_BYTES < 1:
+        warnings.append("MINIMUM_FREE_BYTES must be a positive integer")
     if SAVE_EVERY_N_BATCHES < 1:
-        warnings.append("SAVE_EVERY_N_BATCHES must be >= 1, using default 5")
-        SAVE_EVERY_N_BATCHES = 5
+        warnings.append("SAVE_EVERY_N_BATCHES must be >= 1")
 
     # Validate output directories are writable
     try:
@@ -146,6 +228,7 @@ def print_config_summary() -> None:
     logger.info(f"  Batches before token refresh: {BATCHES_BEFORE_TOKEN_REFRESH}")
     logger.info(f"  Max comments: {MAX_COMMENTS}")
     logger.info(f"  Max workers: {MAX_WORKERS}")
+    logger.info(f"  Diagnostics rotation: {DIAGNOSTICS_MAX_BYTES} bytes x {DIAGNOSTICS_BACKUP_COUNT} backups")
     logger.info(f"  Save every N batches: {SAVE_EVERY_N_BATCHES}")
     logger.info(f"  Test mode: {TEST_MODE}")
     logger.info(f"  Output directory: {OUTPUT_DIR}")
