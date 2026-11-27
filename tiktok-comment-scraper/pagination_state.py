@@ -113,22 +113,6 @@ DEFAULT_STALLED_TIMEOUT_SECONDS: int = 300
 DEFAULT_ELAPSED_TIMEOUT_SECONDS: int = 600
 
 
-@dataclass
-class PaginatorResult:
-    outcome: PaginatorOutcome
-    metadata: PaginationMetadata
-    error: Optional[ScraperError] = None
-    comments_returned: int = 0
-
-    def to_dict(self) -> dict:
-        return {
-            "outcome": self.outcome.name,
-            "metadata": self.metadata.to_dict(),
-            "error": self.error.to_dict() if self.error else None,
-            "comments_returned": self.comments_returned,
-        }
-
-
 class CursorRegression(Enum):
     """Enum representing cursor regression states."""
     NONE = auto()
