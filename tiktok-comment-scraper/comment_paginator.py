@@ -207,14 +207,20 @@ class CommentPaginator:
 
                 next_cursor = batch.get("next_cursor")
                 if has_more:
-                    if (
-                        isinstance(next_cursor, bool)
-                        or not isinstance(next_cursor, int)
-                        or next_cursor <= cursor
-                    ):
+                    if isinstance(next_cursor, bool) or not isinstance(next_cursor, int) or next_cursor < 0:
                         return self._finish(
                             PaginatorOutcome.STALLED, PaginationState.STALLED,
                             "missing_or_invalid_returned_cursor",
+                        )
+                    if next_cursor == cursor:
+                        return self._finish(
+                            PaginatorOutcome.STALLED, PaginationState.STALLED,
+                            "cursor_not_advancing",
+                        )
+                    if next_cursor < cursor:
+                        return self._finish(
+                            PaginatorOutcome.STALLED, PaginationState.STALLED,
+                            "cursor_regression",
                         )
                     can_continue, reason = self.cursor_checker.check_cursor_advancement(next_cursor)
                     if not can_continue:
