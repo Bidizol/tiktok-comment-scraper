@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import re
 from typing import Optional, Tuple
+from urllib.parse import quote
 
 # Try to import from errors module, fall back to standalone definitions
 try:
@@ -188,6 +189,27 @@ class ProxyManager:
         redacted = re.sub(r'://[^:@]+:[^@]*@', '://***@', raw_url)
         redacted = re.sub(r'://[^:@]+@', '://***@', redacted)
         return redacted
+
+    @property
+    def proxy_url(self) -> Optional[str]:
+        """Return the configured proxy URL for transport setup only.
+
+        Callers must never log or include this value in diagnostics because it
+        may contain credentials.
+        """
+        if not self._validated:
+            valid, error = self.validate()
+            if not valid:
+                raise ValueError(error or "Invalid proxy configuration")
+        if not self.proxy_host or not self.proxy_port:
+            return None
+        authority = self.proxy_host + ":" + str(self.proxy_port)
+        if self.proxy_user:
+            credentials = quote(self.proxy_user, safe="")
+            if self.proxy_pass:
+                credentials += ":" + quote(self.proxy_pass, safe="")
+            authority = credentials + "@" + authority
+        return "http://" + authority
 
     @property
     def redacted_url(self) -> str:
