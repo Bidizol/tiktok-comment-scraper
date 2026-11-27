@@ -120,7 +120,7 @@ The supported scraper command is `python tiktokscraper-1.py` from this directory
 macOS/Linux:
 
 ```bash
-cp .env.example .env
+if [ ! -f .env ]; then cp .env.example .env; fi
 python3 -m venv .venv
 source .venv/bin/activate
 python tiktokscraper-1.py
@@ -130,7 +130,7 @@ Windows PowerShell:
 
 ```powershell
 py -3.10 -m venv .venv
-Copy-Item .env.example .env
+if (!(Test-Path .env)) { Copy-Item .env.example .env }
 .\.venv\Scripts\Activate.ps1
 python tiktokscraper-1.py
 ```
@@ -155,7 +155,7 @@ Keep all three active data directories on persistent storage. Do not place the c
 Docker Compose is provided at the repository root. Create the local configuration file first:
 
 ```bash
-cp tiktok-comment-scraper/.env.example tiktok-comment-scraper/.env
+if [ ! -f tiktok-comment-scraper/.env ]; then cp tiktok-comment-scraper/.env.example tiktok-comment-scraper/.env; fi
 ```
 
 Edit the file and set the target video ID and author. Then, from the repository root:
