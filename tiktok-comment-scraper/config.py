@@ -74,7 +74,7 @@ HTTP_CONNECT_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_CONNECT_TIMEOUT
 HTTP_READ_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_READ_TIMEOUT_SECONDS", "20"))
 HTTP_TOTAL_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_TOTAL_TIMEOUT_SECONDS", "30"))
 HTTP_MAX_RESPONSE_BYTES: int = int(os.environ.get("HTTP_MAX_RESPONSE_BYTES", str(5 * 1024 * 1024)))
-HTTP_MAX_RETRIES: int = int(os.environ.get("HTTP_MAX_RETRIES", "3"))
+HTTP_MAX_RETRIES: int = int(os.environ.get("HTTP_MAX_RETRIES", "6"))
 
 # Derived proxy URL — constructed only when needed, never logged directly
 def get_proxy_url() -> str:

@@ -576,9 +576,9 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
     run_id = run_id or str(uuid.uuid4())
     recovery_budget = RecoveryBudget(
         video_id=str(video_id), run_id=run_id, worker_id=worker_id,
-        maximum_retries=12, maximum_elapsed_seconds=DEFAULT_ELAPSED_TIMEOUT_SECONDS,
-        maximum_consecutive_failures=6, maximum_token_refresh_retries=6,
-        maximum_proxy_retries=2,
+        maximum_retries=48, maximum_elapsed_seconds=DEFAULT_ELAPSED_TIMEOUT_SECONDS,
+        maximum_consecutive_failures=12, maximum_token_refresh_retries=12,
+        maximum_proxy_retries=12,
     )
     token_manager = TokenManager(worker_id, transport=transport, retry_budget=recovery_budget)
     platform_adapter = TikTokAdapter(

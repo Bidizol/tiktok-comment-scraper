@@ -146,7 +146,7 @@ class HTTPTransport:
     """
     def __init__(self, connect_timeout=DEFAULT_CONNECT_TIMEOUT, read_timeout=DEFAULT_READ_TIMEOUT,
                  overall_timeout=DEFAULT_TIMEOUT, proxy_url=None, *, proxy_required=False,
-                 max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES, max_retries=3):
+                 max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES, max_retries=6):
         self.connect_timeout=_positive_timeout(connect_timeout,"connect_timeout")
         self.read_timeout=_positive_timeout(read_timeout,"read_timeout")
         self.overall_timeout=_positive_timeout(overall_timeout,"overall_timeout")

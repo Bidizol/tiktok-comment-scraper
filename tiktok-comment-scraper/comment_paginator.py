@@ -35,9 +35,11 @@ class PaginatorOutcome(Enum):
 
 DEFAULT_MAX_BATCHES = 500
 DEFAULT_MAX_COMMENTS = 10_000
-DEFAULT_MAX_CONSECUTIVE_EMPTY = 3
-DEFAULT_STALLED_TIMEOUT_SECONDS = 300
-DEFAULT_ELAPSED_TIMEOUT_SECONDS = 600
+DEFAULT_MAX_CONSECUTIVE_EMPTY = 12
+DEFAULT_STALLED_TIMEOUT_SECONDS = 600
+DEFAULT_ELAPSED_TIMEOUT_SECONDS = 900
+DEFAULT_TERMINAL_CONFIRMATION_ATTEMPTS = 6
+DEFAULT_TERMINAL_CONFIRMATION_INTERVAL_SECONDS = 5.0
 MAX_CURSOR_VALUE = (2 ** 63) - 1
 MAX_MALFORMED_RECORDS_IN_MEMORY = 1_000
 
@@ -65,7 +67,7 @@ class PaginatorResult:
 
 
 class CommentPaginator:
-    """Only a validated has_more=False response can end pagination normally."""
+    """Paginate with bounded recovery and repeated confirmation of terminal pages."""
 
     def __init__(
         self, *, video_id: str, run_id: str, worker_id: Optional[int] = None,
@@ -73,14 +75,20 @@ class CommentPaginator:
         max_consecutive_empty: int = DEFAULT_MAX_CONSECUTIVE_EMPTY,
         stalled_timeout_seconds: int = DEFAULT_STALLED_TIMEOUT_SECONDS,
         elapsed_timeout_seconds: int = DEFAULT_ELAPSED_TIMEOUT_SECONDS,
+        terminal_confirmation_attempts: int = DEFAULT_TERMINAL_CONFIRMATION_ATTEMPTS,
+        terminal_confirmation_interval_seconds: float = DEFAULT_TERMINAL_CONFIRMATION_INTERVAL_SECONDS,
         transport: Optional[HTTPTransport] = None, retry_budget: Any = None,
         stop_event: Any = None, adapter: Optional[PlatformAdapter] = None,
     ):
+        if isinstance(terminal_confirmation_attempts, bool) or not isinstance(terminal_confirmation_attempts, int):
+            raise ValueError("terminal_confirmation_attempts must be an integer")
         limits = {
             "max_batches": max_batches, "max_comments": max_comments,
             "max_consecutive_empty": max_consecutive_empty,
             "stalled_timeout_seconds": stalled_timeout_seconds,
             "elapsed_timeout_seconds": elapsed_timeout_seconds,
+            "terminal_confirmation_attempts": terminal_confirmation_attempts,
+            "terminal_confirmation_interval_seconds": terminal_confirmation_interval_seconds,
         }
         invalid = [name for name, value in limits.items()
                    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 1]
@@ -102,6 +110,8 @@ class CommentPaginator:
         self.max_consecutive_empty = int(max_consecutive_empty)
         self.stalled_timeout_seconds = float(stalled_timeout_seconds)
         self.elapsed_timeout_seconds = float(elapsed_timeout_seconds)
+        self.terminal_confirmation_attempts = int(terminal_confirmation_attempts)
+        self.terminal_confirmation_interval_seconds = float(terminal_confirmation_interval_seconds)
         self.transport = transport or HTTPTransport()
         self.retry_budget = retry_budget
         self.stop_event = stop_event
@@ -142,6 +152,8 @@ class CommentPaginator:
         cursor = initial_cursor
         consecutive_empty = 0
         consecutive_no_new = 0
+        terminal_page_fingerprint = None
+        terminal_confirmation_count = 0
         malformed_records: List[Any] = []
 
         def remember_malformed(record: Any) -> None:
@@ -217,8 +229,18 @@ class CommentPaginator:
                 if not isinstance(comments, list):
                     return self._schema_failure("malformed_comments", "Comment API comments field must be a list")
                 next_cursor = batch.get("next_cursor")
+                page_fingerprint = tuple(
+                    (
+                        str(record.get("cid", "")),
+                        str(record.get("text", "")),
+                        str(record.get("create_time", "")),
+                    )
+                    for record in comments if isinstance(record, dict)
+                )
 
                 if has_more:
+                    terminal_page_fingerprint = None
+                    terminal_confirmation_count = 0
                     if isinstance(next_cursor, bool) or not isinstance(next_cursor, int) or not 0 <= next_cursor <= MAX_CURSOR_VALUE:
                         return self._finish(
                             PaginatorOutcome.PAGINATION_STALLED, PaginationState.PAGINATION_STALLED,
@@ -234,6 +256,34 @@ class CommentPaginator:
                         )
                 else:
                     next_cursor = cursor
+                    if terminal_page_fingerprint is None or page_fingerprint != terminal_page_fingerprint:
+                        terminal_page_fingerprint = page_fingerprint
+                        terminal_confirmation_count = 0
+                    else:
+                        terminal_confirmation_count += 1
+                        logger.warning(
+                            "TikTok terminal page repeated: video_id=%s cursor=%s "
+                            "confirmation=%d/%d records=%d",
+                            self.video_id, cursor, terminal_confirmation_count,
+                            self.terminal_confirmation_attempts, len(comments),
+                        )
+                        if terminal_confirmation_count >= self.terminal_confirmation_attempts:
+                            if self.metadata.records_received == 0:
+                                return self._finish(
+                                    PaginatorOutcome.EMPTY_UNCONFIRMED,
+                                    PaginationState.EMPTY_UNCONFIRMED,
+                                    "empty_result_after_repeated_terminal_confirmation",
+                                    malformed=malformed_records,
+                                )
+                            return self._finish(
+                                PaginatorOutcome.COMPLETE,
+                                PaginationState.COMPLETE,
+                                "terminal_page_stable_after_repeated_confirmation",
+                                malformed=malformed_records,
+                            )
+                        if self.terminal_confirmation_interval_seconds > 0:
+                            time.sleep(self.terminal_confirmation_interval_seconds)
+                        continue
 
                 retained = comments[:remaining]
                 page_truncated = len(retained) < len(comments)
@@ -358,6 +408,14 @@ class CommentPaginator:
                     pages_without_new_comments=consecutive_no_new,
                 )
 
+                logger.info(
+                    "Pagination page received: video_id=%s batch=%d requested_cursor=%s "
+                    "returned_cursor=%s has_more=%s records=%d accepted=%d duplicates=%d "
+                    "consecutive_no_new=%d",
+                    self.video_id, self.metadata.batch_number, cursor, next_cursor,
+                    has_more, records_received, accepted, duplicate_count, consecutive_no_new,
+                )
+
                 checkpoint_cursor = cursor if page_truncated else next_cursor
                 batch_info = {
                     "comments": retained,
@@ -415,15 +473,14 @@ class CommentPaginator:
                     last_progress = time.monotonic()
 
                 if not has_more:
-                    if self.metadata.records_received == 0:
-                        return self._finish(PaginatorOutcome.EMPTY_UNCONFIRMED, PaginationState.EMPTY_UNCONFIRMED,
-                                            "empty_result_not_independently_confirmed", malformed=malformed_records)
-                    if (consecutive_no_new >= self.max_consecutive_empty
-                            or self.metadata.malformed_rejected > 0):
-                        return self._finish(PaginatorOutcome.COMPLETE_SUSPECT, PaginationState.COMPLETE_SUSPECT,
-                                            "api_end_reached_after_pages_without_new_comments", malformed=malformed_records)
-                    return self._finish(PaginatorOutcome.COMPLETE, PaginationState.COMPLETE,
-                                        "api_confirmed_end_of_data", malformed=malformed_records)
+                    logger.warning(
+                        "TikTok reported a provisional end: video_id=%s cursor=%s "
+                        "records=%d; rechecking same cursor before completion",
+                        self.video_id, cursor, records_received,
+                    )
+                    if self.terminal_confirmation_interval_seconds > 0:
+                        time.sleep(self.terminal_confirmation_interval_seconds)
+                    continue
 
                 cursor = next_cursor
 
@@ -486,6 +543,8 @@ def paginate_comments(
     max_consecutive_empty: int = DEFAULT_MAX_CONSECUTIVE_EMPTY,
     stalled_timeout_seconds: int = DEFAULT_STALLED_TIMEOUT_SECONDS,
     elapsed_timeout_seconds: int = DEFAULT_ELAPSED_TIMEOUT_SECONDS,
+    terminal_confirmation_attempts: int = DEFAULT_TERMINAL_CONFIRMATION_ATTEMPTS,
+    terminal_confirmation_interval_seconds: float = DEFAULT_TERMINAL_CONFIRMATION_INTERVAL_SECONDS,
     initial_cursor: int = 0, on_comment: Optional[Callable[[dict], Any]] = None,
     on_batch: Optional[Callable[[dict], Any]] = None,
     on_malformed_comment: Optional[Callable[[Any, str], Any]] = None,
@@ -496,7 +555,10 @@ def paginate_comments(
         video_id=video_id, run_id=run_id, max_batches=max_batches,
         max_comments=max_comments, max_consecutive_empty=max_consecutive_empty,
         stalled_timeout_seconds=stalled_timeout_seconds,
-        elapsed_timeout_seconds=elapsed_timeout_seconds, transport=transport,
+        elapsed_timeout_seconds=elapsed_timeout_seconds,
+        terminal_confirmation_attempts=terminal_confirmation_attempts,
+        terminal_confirmation_interval_seconds=terminal_confirmation_interval_seconds,
+        transport=transport,
         retry_budget=retry_budget, stop_event=stop_event,
     )
     return paginator.run(
