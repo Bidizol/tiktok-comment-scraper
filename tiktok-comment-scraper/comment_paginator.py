@@ -241,7 +241,7 @@ class CommentPaginator:
                     requested_cursor=cursor,
                     returned_cursor=next_cursor,
                     batch_number=self.metadata.batch_number + 1,
-                    records_returned=self.metadata.records_returned + len(retained),
+                    records_returned=self.metadata.records_returned + accepted,
                     valid_comments_extracted=self.metadata.valid_comments_extracted + accepted,
                     has_more=has_more,
                     timestamp=datetime.now(timezone.utc),
