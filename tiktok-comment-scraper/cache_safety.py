@@ -418,7 +418,7 @@ def save_and_load_cache_safe(
 def load_cache_safe(
     cache_dir: Path,
     worker_id: int,
-    video_id: int,
+    video_id: str,
 ) -> Tuple[Optional[dict], str]:
     """Safely load cache data with validation.
 
@@ -441,6 +441,21 @@ def load_cache_safe(
 
         if data is None:
             return None, "Failed to parse cache file (corrupted JSON)"
+
+        # Cache filenames are not proof of identity. Reject and quarantine
+        # payloads whose embedded video/worker identity does not match the
+        # requested cache key.
+        if data.get("video_id") != str(video_id) or data.get("worker_id") != worker_id:
+            reason = "Cache identity does not match requested video_id/worker_id"
+            quarantine_path = _quarantine_cache(cache_file, data)
+            if quarantine_path:
+                return {
+                    "_quarantined": True,
+                    "_quarantine_path": str(quarantine_path),
+                    "_original_filename": cache_file.name,
+                    "_corruption_reason": reason,
+                }, f"Cache identity mismatch; quarantined: {reason}"
+            return data, f"Cache identity mismatch; quarantine failed: {reason}"
 
         # Validate the cache
         status, reason = validate_cache(data, cache_file.name)
