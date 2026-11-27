@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from dataclasses import asdict, dataclass
@@ -113,13 +114,20 @@ def collect_startup_diagnostics(settings: Settings) -> list[DiagnosticCheck]:
                 DiagnosticCheck("curl", "FAILED", "curl executable was not found")
             )
         else:
-            checks.append(
-                DiagnosticCheck(
-                    "curl",
-                    "OK",
-                    "curl executable is available; version details are deferred to transport initialization",
+            try:
+                completed = subprocess.run(
+                    [curl_path, "--version"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
                 )
-            )
+                version_line = completed.stdout.splitlines()[0].strip()
+                checks.append(DiagnosticCheck("curl", "OK", version_line[:160]))
+            except (OSError, subprocess.SubprocessError, IndexError):
+                checks.append(
+                    DiagnosticCheck("curl", "FAILED", "curl version information is unavailable")
+                )
     else:
         checks.append(
             DiagnosticCheck("http_backend", "OK", "Python urllib backend selected")

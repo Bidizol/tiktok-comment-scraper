@@ -27,3 +27,7 @@ scraper_comments.csv
 .DS_Store
 .idea/
 .vscode/
+
+# New application runtime data
+/data/
+/reports/
