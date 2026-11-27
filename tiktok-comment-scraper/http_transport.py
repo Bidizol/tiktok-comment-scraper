@@ -65,10 +65,18 @@ class HTTPTransport:
         connect_timeout: int = DEFAULT_CONNECT_TIMEOUT,
         read_timeout: int = DEFAULT_READ_TIMEOUT,
         overall_timeout: int = DEFAULT_TIMEOUT,
+        proxy_url: Optional[str] = None,
     ):
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
         self.overall_timeout = overall_timeout
+        # The URL is retained only for constructing the opener; it is never logged.
+        self.proxy_url = proxy_url
+        self._opener = None
+        if proxy_url:
+            self._opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+            )
 
     def request(
         self,
@@ -92,16 +100,23 @@ class HTTPTransport:
             url, method=method, headers=headers or {}, data=body
         )
         try:
-            response = urllib.request.urlopen(request, timeout=timeout)
-            status_code = response.getcode()
-            raw_body = response.read()
-            close = getattr(response, "close", None)
-            if callable(close):
-                close()
+            opener = self._opener
+            if opener is None:
+                response_context = urllib.request.urlopen(request, timeout=timeout)
+            else:
+                response_context = opener.open(request, timeout=timeout)
+            with response_context as response:
+                status_code = response.getcode()
+                raw_body = response.read()
         except urllib.error.HTTPError as error:
+            try:
+                error.close()
+            except OSError:
+                pass
             logger.warning("HTTP request failed with status %s", error.code)
             return int(error.code), None
         except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as error:
+            # Do not include exception text: it can contain URLs or credentials.
             logger.warning("HTTP request failed (%s)", type(error).__name__)
             return 0, None
 
