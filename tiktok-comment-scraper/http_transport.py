@@ -72,7 +72,7 @@ class HTTPTransport:
         self.overall_timeout = overall_timeout
         # The URL is retained only for constructing the opener; it is never logged.
         self.proxy_url = proxy_url
-        self.last_response_headers: Dict[str, str] = {}
+        self.last_response_headers = None
         self._opener = None
         if proxy_url:
             self._opener = urllib.request.build_opener(
@@ -108,7 +108,7 @@ class HTTPTransport:
                 response_context = opener.open(request, timeout=timeout)
             with response_context as response:
                 status_code = response.getcode()
-                self.last_response_headers = dict(response.headers.items())
+                self.last_response_headers = response.headers
                 raw_body = response.read()
         except urllib.error.HTTPError as error:
             try:
