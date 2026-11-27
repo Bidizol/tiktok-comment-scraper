@@ -191,12 +191,19 @@ class CommentPaginator:
                         self._error("MALFORMED_COMMENTS", "Comment API comments field must be a list"),
                     )
 
+                if batch.get("error"):
+                    return self._finish(
+                        PaginatorOutcome.FAILED, PaginationState.FAILED,
+                        "api_error",
+                        self._error("API_ERROR", str(batch.get("error"))[:160]),
+                    )
+
                 next_cursor = batch.get("next_cursor")
                 if has_more:
                     if (
                         isinstance(next_cursor, bool)
                         or not isinstance(next_cursor, int)
-                        or next_cursor < 0
+                        or next_cursor <= cursor
                     ):
                         return self._finish(
                             PaginatorOutcome.STALLED, PaginationState.STALLED,
