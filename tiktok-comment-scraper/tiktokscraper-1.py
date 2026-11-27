@@ -419,6 +419,38 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
     last_checkpoint_cursor = cursor
     last_checkpoint_batch = base_batch_number
     cache_errors = []
+    quarantine_dir = CACHE_DIR / "quarantine"
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    malformed_path = quarantine_dir / f"worker_{worker_id}_{video_id}.jsonl"
+
+    def quarantine_malformed(record, reason):
+        """Append malformed source records to a per-video, restricted sidecar."""
+        entry = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "video_id": video_id,
+            "worker_id": worker_id,
+            "reason": reason,
+            "record": record,
+        }
+        encoded = (json.dumps(entry, ensure_ascii=False, default=str) + "\n").encode("utf-8")
+        descriptor = os.open(
+            str(malformed_path),
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "ab") as quarantine_file:
+                quarantine_file.write(encoded)
+                quarantine_file.flush()
+                os.fsync(quarantine_file.fileno())
+        except Exception:
+            # fdopen owns the descriptor after it succeeds; otherwise close it.
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
 
     def normalize_cid(cid):
         if cid is None or isinstance(cid, bool):
@@ -486,6 +518,7 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
             mstoken=token_manager.get_token,
             on_comment=retain_comment,
             on_batch=persist_batch,
+            on_malformed_comment=quarantine_malformed,
         )
         naturally_completed = pagination_result.outcome == PaginatorOutcome.COMPLETED
         stop_reason = pagination_result.metadata.stop_reason or pagination_result.outcome.name.lower()
@@ -535,6 +568,7 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
         "pagination_outcome": pagination_result.outcome.name if pagination_result else "NOT_STARTED",
         "pagination_metrics": pagination_result.metadata.to_dict() if pagination_result else {},
         "malformed_comments": pagination_result.malformed_comments if pagination_result else [],
+        "malformed_comments_path": str(malformed_path) if pagination_result and pagination_result.metadata.malformed_rejected and malformed_path.exists() else None,
         "comments": all_comments,
     }
 

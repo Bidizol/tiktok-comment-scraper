@@ -241,21 +241,45 @@ class CommentPaginator:
                         malformed_records.append(record)
                         malformed_count += 1
                         if on_malformed_comment is not None:
-                            on_malformed_comment(record, reason)
+                            try:
+                                on_malformed_comment(record, reason)
+                            except Exception as quarantine_error:
+                                return self._finish(
+                                    PaginatorOutcome.FAILED_RESUMABLE, PaginationState.FAILED_RESUMABLE,
+                                    "malformed_comment_quarantine_failed",
+                                    self._error("STORAGE_ERROR", type(quarantine_error).__name__, outcome=ErrorOutcome.FAILED_RESUMABLE),
+                                    malformed_records,
+                                )
                         continue
                     if not self._comment_shape_is_recognized(record):
                         reason = "unrecognized_comment_schema"
                         malformed_records.append(record)
                         malformed_count += 1
                         if on_malformed_comment is not None:
-                            on_malformed_comment(record, reason)
+                            try:
+                                on_malformed_comment(record, reason)
+                            except Exception as quarantine_error:
+                                return self._finish(
+                                    PaginatorOutcome.FAILED_RESUMABLE, PaginationState.FAILED_RESUMABLE,
+                                    "malformed_comment_quarantine_failed",
+                                    self._error("STORAGE_ERROR", type(quarantine_error).__name__, outcome=ErrorOutcome.FAILED_RESUMABLE),
+                                    malformed_records,
+                                )
                         continue
                     if not self._has_minimum_content(record):
                         reason = "comment_text_missing_or_invalid"
                         malformed_records.append(record)
                         malformed_count += 1
                         if on_malformed_comment is not None:
-                            on_malformed_comment(record, reason)
+                            try:
+                                on_malformed_comment(record, reason)
+                            except Exception as quarantine_error:
+                                return self._finish(
+                                    PaginatorOutcome.FAILED_RESUMABLE, PaginationState.FAILED_RESUMABLE,
+                                    "malformed_comment_quarantine_failed",
+                                    self._error("STORAGE_ERROR", type(quarantine_error).__name__, outcome=ErrorOutcome.FAILED_RESUMABLE),
+                                    malformed_records,
+                                )
                         continue
                     usable_comment_records += 1
                     if not self._has_comment_id(record):
