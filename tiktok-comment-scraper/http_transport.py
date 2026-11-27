@@ -38,8 +38,8 @@ def _positive_timeout(value: float, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a positive finite number")
     value = float(value)
-    if not math.isfinite(value) or value <= 0:
-        raise ValueError(f"{name} must be a positive finite number")
+    if not math.isfinite(value) or value <= 0 or value > 600:
+        raise ValueError(f"{name} must be finite and between 0 and 600 seconds")
     return value
 
 def _retry_after(headers) -> float | None:
@@ -69,6 +69,7 @@ def _validate_url(url: str):
 
 def _classify_exception(error: BaseException, proxy_enabled: bool):
     if isinstance(error, ssl.SSLError): return "TLS_ERROR", False
+    if isinstance(error, http.client.HTTPException): return ("PROXY_ERROR" if proxy_enabled else "NETWORK_ERROR"), True
     if isinstance(error, socket.gaierror): return "DNS_ERROR", True
     nested_reason = getattr(error, "reason", None)
     if isinstance(nested_reason, ssl.SSLError): return "TLS_ERROR", False
@@ -98,8 +99,9 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         same_origin = (
             old.hostname == new.hostname
             and old_port == new_port
-            and new.scheme == "https" if old.scheme == "https"
-            else old.hostname == new.hostname and old_port == new_port and new.scheme == old.scheme
+            and new.scheme == old.scheme
+            and new.username is None
+            and new.password is None
         )
         if not same_origin:
             return None
@@ -149,8 +151,8 @@ class HTTPTransport:
         self.connect_timeout=_positive_timeout(connect_timeout,"connect_timeout")
         self.read_timeout=_positive_timeout(read_timeout,"read_timeout")
         self.overall_timeout=_positive_timeout(overall_timeout,"overall_timeout")
-        if isinstance(max_response_bytes,bool) or not isinstance(max_response_bytes,int) or max_response_bytes<1:
-            raise ValueError("max_response_bytes must be a positive integer")
+        if isinstance(max_response_bytes,bool) or not isinstance(max_response_bytes,int) or not 1 <= max_response_bytes <= 50 * 1024 * 1024:
+            raise ValueError("max_response_bytes must be between 1 and 52428800")
         if proxy_required and not proxy_url: raise ValueError("A proxy is required but no proxy URL was configured")
         if proxy_url:
             proxy=urllib.parse.urlsplit(proxy_url)
@@ -254,8 +256,8 @@ class HTTPTransport:
         maximum_attempts = self.max_retries if maximum_attempts is None else maximum_attempts
         if isinstance(maximum_attempts,bool) or not isinstance(maximum_attempts,int) or not 1 <= maximum_attempts <= 10:
             raise ValueError("maximum_attempts must be an integer between 1 and 10")
-        if not math.isfinite(max_backoff_seconds) or max_backoff_seconds < 0:
-            raise ValueError("max_backoff_seconds must be finite and non-negative")
+        if not math.isfinite(max_backoff_seconds) or not 0 <= max_backoff_seconds <= 300:
+            raise ValueError("max_backoff_seconds must be finite and between 0 and 300")
         last=None
         for attempt in range(1,maximum_attempts+1):
             try:
