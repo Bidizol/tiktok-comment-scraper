@@ -354,7 +354,7 @@ class CommentPaginator:
                     "referer": "https://www.tiktok.com/",
                 },
                 expect_json=True,
-                maximum_attempts=3,
+                maximum_attempts=self.transport.max_retries,
             )
         except HTTPTransportError as transport_error:
             outcome = (

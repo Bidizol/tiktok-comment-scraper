@@ -103,8 +103,10 @@ class Settings:
                 raise ConfigurationError(
                     "PROXY_URL must be an absolute HTTP or HTTPS proxy URL"
                 )
+            if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+                raise ConfigurationError("PROXY_URL must not contain a path, query or fragment")
             try:
-                if parsed.port is not None and not 1 <= parsed.port <= 65535:
+                if parsed.port is None or not 1 <= parsed.port <= 65535:
                     raise ValueError
             except ValueError as exc:
                 raise ConfigurationError("PROXY_URL contains an invalid port") from exc

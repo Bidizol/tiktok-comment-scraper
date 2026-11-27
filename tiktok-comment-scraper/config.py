@@ -21,13 +21,26 @@ if ENV_PATH.exists():
         for env_line in env_file:
             if '=' in env_line:
                 env_key, env_value = env_line.strip().split('=', 1)
-                os.environ[env_key] = env_value
+                env_value = env_value.strip()
+                if len(env_value) >= 2 and env_value[0] == env_value[-1] and env_value[0] in {"'", '"'}:
+                    env_value = env_value[1:-1]
+                else:
+                    env_value = env_value.split(" #", 1)[0].strip()
+                # Process environment always takes precedence over the .env file.
+                if env_key not in os.environ:
+                    os.environ[env_key] = env_value
 
 # Proxy configuration
 PROXY_HOST: str = os.environ.get("PROXY_HOST", "")
 PROXY_PORT: str = os.environ.get("PROXY_PORT", "")
 PROXY_USER: str = os.environ.get("PROXY_USER", "")
 PROXY_PASS: str = os.environ.get("PROXY_PASS", "")
+PROXY_REQUIRED: bool = os.environ.get("PROXY_REQUIRED", "0").strip().lower() in {"1", "true", "yes"}
+HTTP_CONNECT_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_CONNECT_TIMEOUT_SECONDS", "15"))
+HTTP_READ_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_READ_TIMEOUT_SECONDS", "20"))
+HTTP_TOTAL_TIMEOUT_SECONDS: float = float(os.environ.get("HTTP_TOTAL_TIMEOUT_SECONDS", "30"))
+HTTP_MAX_RESPONSE_BYTES: int = int(os.environ.get("HTTP_MAX_RESPONSE_BYTES", str(5 * 1024 * 1024)))
+HTTP_MAX_RETRIES: int = int(os.environ.get("HTTP_MAX_RETRIES", "3"))
 
 # Derived proxy URL — constructed only when needed, never logged directly
 def get_proxy_url() -> str:
@@ -100,6 +113,20 @@ def validate_config() -> list[str]:
         warnings.append(
             "PROXY_HOST and PROXY_PORT must both be set or both be unset"
         )
+
+    for name, value in (
+        ("HTTP_CONNECT_TIMEOUT_SECONDS", HTTP_CONNECT_TIMEOUT_SECONDS),
+        ("HTTP_READ_TIMEOUT_SECONDS", HTTP_READ_TIMEOUT_SECONDS),
+        ("HTTP_TOTAL_TIMEOUT_SECONDS", HTTP_TOTAL_TIMEOUT_SECONDS),
+    ):
+        if not __import__("math").isfinite(value) or value <= 0:
+            warnings.append(f"{name} must be a finite positive number")
+    if HTTP_MAX_RESPONSE_BYTES < 1024:
+        warnings.append("HTTP_MAX_RESPONSE_BYTES must be at least 1024")
+    if HTTP_MAX_RETRIES < 1:
+        warnings.append("HTTP_MAX_RETRIES must be >= 1")
+    if PROXY_REQUIRED and not (PROXY_HOST and PROXY_PORT):
+        warnings.append("PROXY_REQUIRED is enabled but PROXY_HOST/PROXY_PORT are missing")
 
     if COMMENTS_PER_BATCH < 1:
         warnings.append("COMMENTS_PER_BATCH must be >= 1")

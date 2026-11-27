@@ -114,7 +114,7 @@ class HTTPTransport:
     """Thread-safe transport; each request owns its opener and response metadata."""
     def __init__(self, connect_timeout=DEFAULT_CONNECT_TIMEOUT, read_timeout=DEFAULT_READ_TIMEOUT,
                  overall_timeout=DEFAULT_TIMEOUT, proxy_url=None, *, proxy_required=False,
-                 max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES):
+                 max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES, max_retries=3):
         self.connect_timeout=_positive_timeout(connect_timeout,"connect_timeout")
         self.read_timeout=_positive_timeout(read_timeout,"read_timeout")
         self.overall_timeout=_positive_timeout(overall_timeout,"overall_timeout")
@@ -132,7 +132,10 @@ class HTTPTransport:
                     raise ValueError
             except ValueError as exc:
                 raise ValueError("Proxy URL must include a valid explicit port") from exc
-        self.proxy_url=proxy_url; self.proxy_required=bool(proxy_required); self.max_response_bytes=max_response_bytes
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 1:
+            raise ValueError("max_retries must be a positive integer")
+        self.proxy_url=proxy_url; self.proxy_required=bool(proxy_required)
+        self.max_response_bytes=max_response_bytes; self.max_retries=max_retries
 
     def request_detailed(self, method, url, *, headers=None, body=None, expect_json=True,
                          connect_timeout=None, read_timeout=None, overall_timeout=None):
@@ -211,9 +214,10 @@ class HTTPTransport:
         return HTTPResponse(status,response_headers,raw,parsed_json,datetime.now(timezone.utc).isoformat())
 
     def request_with_retry(self, method, url, *, headers=None, body=None, expect_json=True,
-                           maximum_attempts=3, max_backoff_seconds=30.0):
+                           maximum_attempts=None, max_backoff_seconds=30.0):
         if method.upper() not in {"GET","HEAD"} or body is not None:
             raise ValueError("Automatic retries are restricted to idempotent GET/HEAD requests")
+        maximum_attempts = self.max_retries if maximum_attempts is None else maximum_attempts
         if isinstance(maximum_attempts,bool) or not isinstance(maximum_attempts,int) or maximum_attempts<1:
             raise ValueError("maximum_attempts must be a positive integer")
         if not math.isfinite(max_backoff_seconds) or max_backoff_seconds < 0:

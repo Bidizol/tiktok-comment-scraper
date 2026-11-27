@@ -361,7 +361,11 @@ def save_cache(worker_id: int, video_id: str, comments: list, seen_cids: set, ba
 def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> dict:
     """Scrape one video through the shared bounded pagination state machine."""
     from http_transport import HTTPTransport
-    from config import PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS
+    from config import (
+        PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS, PROXY_REQUIRED,
+        HTTP_CONNECT_TIMEOUT_SECONDS, HTTP_READ_TIMEOUT_SECONDS,
+        HTTP_TOTAL_TIMEOUT_SECONDS, HTTP_MAX_RESPONSE_BYTES, HTTP_MAX_RETRIES,
+    )
 
     proxy_manager = ProxyManager(
         proxy_host=PROXY_HOST,
@@ -373,7 +377,15 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
     if not proxy_valid:
         raise ValueError("Invalid proxy configuration: " + str(proxy_error))
 
-    transport = HTTPTransport(proxy_url=proxy_manager.proxy_url)
+    transport = HTTPTransport(
+        connect_timeout=HTTP_CONNECT_TIMEOUT_SECONDS,
+        read_timeout=HTTP_READ_TIMEOUT_SECONDS,
+        overall_timeout=HTTP_TOTAL_TIMEOUT_SECONDS,
+        proxy_url=proxy_manager.proxy_url,
+        proxy_required=PROXY_REQUIRED,
+        max_response_bytes=HTTP_MAX_RESPONSE_BYTES,
+        max_retries=HTTP_MAX_RETRIES,
+    )
     token_manager = TokenManager(worker_id, transport=transport)
 
     cached = load_cache(worker_id, video_id)
