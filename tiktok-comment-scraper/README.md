@@ -71,3 +71,20 @@ Per-video checkpoints are stored under `cache/`. They contain a versioned schema
 ## Scope and limitations
 
 TikTok's internal API is not a stable public contract. Response schema or access changes may require adapter updates. Missing timestamps remain null; the scraper does not invent dates. Missing-ID fingerprints are heuristic and cannot guarantee semantic identity.
+
+
+## Monitoring, diagnostics and alerts
+
+Each run creates two append-only JSONL files under `error_reports/`:
+
+- `run_<run_id>.events.jsonl` records run lifecycle, queued/active/completed video work, outcomes, pagination totals, retry-budget summaries, resource snapshots and output artifact locations.
+- `run_<run_id>.alerts.jsonl` records actionable warnings and errors, including incomplete videos, malformed-record quarantine, checkpoint persistence issues, recovery-budget exhaustion and unexpected worker failures.
+
+Event and alert files rotate independently at the configured size. Defaults are 10 MiB per file with five retained backups. Records are sanitized, bounded in size and written with restricted file permissions. The run summary also embeds a monitoring snapshot with worker concurrency, event/alert counts and available disk-space metrics.
+
+Monitoring is local-file based; it does not send email, SMS or external notifications. Inspect the alert JSONL file for the run's actionable conditions.
+
+Optional settings:
+- `DIAGNOSTICS_MAX_BYTES` (64 KiB–100 MiB; defaults to 10 MiB)
+- `DIAGNOSTICS_BACKUP_COUNT` (1–20 retained backups; defaults to 5)
+- `MINIMUM_FREE_BYTES` (minimum free-disk threshold; defaults to 100 MiB and raises a run alert below the threshold)

@@ -105,6 +105,9 @@ SAVE_EVERY_N_BATCHES: int = int(os.environ.get("SAVE_EVERY_N_BATCHES", "5"))
 # Runtime configuration
 MAX_WORKERS: int = int(os.environ.get("MAX_WORKERS", "3"))
 MAX_RUN_COMMENTS: int = int(os.environ.get("MAX_RUN_COMMENTS", "100000"))
+MINIMUM_FREE_BYTES: int = int(os.environ.get("MINIMUM_FREE_BYTES", str(100 * 1024 * 1024)))
+DIAGNOSTICS_MAX_BYTES: int = int(os.environ.get("DIAGNOSTICS_MAX_BYTES", str(10 * 1024 * 1024)))
+DIAGNOSTICS_BACKUP_COUNT: int = int(os.environ.get("DIAGNOSTICS_BACKUP_COUNT", "5"))
 
 # Output configuration
 OUTPUT_DIR: Path = BASE_DIR / "results"
@@ -175,6 +178,12 @@ def validate_config() -> list[str]:
         warnings.append("MAX_WORKERS must be between 1 and 16")
     if MAX_RUN_COMMENTS < 1 or MAX_RUN_COMMENTS > 500_000:
         warnings.append("MAX_RUN_COMMENTS must be between 1 and 500000")
+    if DIAGNOSTICS_MAX_BYTES < 64 * 1024 or DIAGNOSTICS_MAX_BYTES > 100 * 1024 * 1024:
+        warnings.append("DIAGNOSTICS_MAX_BYTES must be between 65536 and 104857600")
+    if DIAGNOSTICS_BACKUP_COUNT < 1 or DIAGNOSTICS_BACKUP_COUNT > 20:
+        warnings.append("DIAGNOSTICS_BACKUP_COUNT must be between 1 and 20")
+    if MINIMUM_FREE_BYTES < 1:
+        warnings.append("MINIMUM_FREE_BYTES must be a positive integer")
     if SAVE_EVERY_N_BATCHES < 1:
         warnings.append("SAVE_EVERY_N_BATCHES must be >= 1")
 
@@ -210,6 +219,7 @@ def print_config_summary() -> None:
     logger.info(f"  Batches before token refresh: {BATCHES_BEFORE_TOKEN_REFRESH}")
     logger.info(f"  Max comments: {MAX_COMMENTS}")
     logger.info(f"  Max workers: {MAX_WORKERS}")
+    logger.info(f"  Diagnostics rotation: {DIAGNOSTICS_MAX_BYTES} bytes x {DIAGNOSTICS_BACKUP_COUNT} backups")
     logger.info(f"  Save every N batches: {SAVE_EVERY_N_BATCHES}")
     logger.info(f"  Test mode: {TEST_MODE}")
     logger.info(f"  Output directory: {OUTPUT_DIR}")

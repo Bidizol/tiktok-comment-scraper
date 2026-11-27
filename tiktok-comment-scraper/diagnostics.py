@@ -1,400 +1,319 @@
-"""Diagnostics recording for failed HTTP or token operations.
-
-For every failed operation, records:
-- UTC timestamp.
-- Run ID.
-- Component and function.
-- Error code.
-- HTTP status, where available.
-- Retry attempt.
-- Recovery action.
-- Final outcome.
-
-Never records secrets.
-"""
-
+"""Bounded, thread-safe run diagnostics and local alert recording."""
 from __future__ import annotations
 
 import json
-import logging
 import os
-import uuid
+import re
+import shutil
+import threading
+from collections import Counter
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any
 
-# Import error taxonomy - use try/except for compatibility with
-# Phase 1's relative-import issues in errors/classifiers.py
-try:
-    from errors.model import ScraperError, ErrorSeverity, ErrorOutcome
-except ImportError:
-    # Fallback definitions for standalone operation
-    class ErrorSeverity:
-        DEBUG = "DEBUG"
-        INFO = "INFO"
-        WARNING = "WARNING"
-        ERROR = "ERROR"
-        CRITICAL = "CRITICAL"
 
-    class ErrorOutcome:
-        SUCCESS = "success"
-        FAILED_RESUMABLE = "failed_resumable"
-        FAILED_PERMANENT = "failed_permanent"
-        RETRY_EXHAUSTED = "retry_exhausted"
-        INTERRUPTED = "interrupted"
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)(msToken|token|access_token|refresh_token)=([^&\s]+)"),
+    re.compile(r"(?i)(authorization\s*[:=]\s*)([^,;\s]+)"),
+    re.compile(r"(?i)((?:cookie|set-cookie)\s*[:=]\s*)([^\r\n]+)"),
+    re.compile(r"(?i)(https?://)([^/@\s]+:[^/@\s]+)@"),
+    re.compile(r"(?i)(password|passwd|proxy_pass|api_key|secret)\s*[:=]\s*([^\s,;]+)"),
+)
+_ALLOWED_EVENT_FIELDS = {
+    "worker_id", "video_id", "status", "stop_reason", "error_code",
+    "error_type", "http_status", "retry_attempt", "retries_used",
+    "retries_remaining", "recovery_exhausted_reason", "duration_seconds",
+    "total_comments", "total_batches", "records_received", "valid_comments",
+    "new_comments", "duplicates_skipped", "malformed_records",
+    "cache_error_count", "requested_video_jobs", "completed_videos",
+    "partial_videos", "failed_videos", "max_workers", "max_pending_jobs",
+    "max_run_comments", "comments_reserved", "disk_free_bytes",
+    "disk_total_bytes", "disk_usage_percent", "active_workers",
+    "peak_workers", "event_count", "alert_count", "error_count",
+    "warning_count", "pagination_outcome", "component", "function",
+    "output_dir", "summary_path", "json_path", "csv_path",
+}
 
-    class ScraperError:
-        def __init__(self, error_code, severity, component, function,
-                     explanation="", http_status=None, outcome="failed_permanent",
-                     video_id=None, run_id=None, worker_id=None,
-                     batch_number=None, cursor=None, retry_attempt=None,
-                     recovery_action=None):
-            self.error_code = error_code
-            self.severity = severity
-            self.component = component
-            self.function = function
-            self.explanation = explanation
-            self.http_status = http_status
-            self.outcome = outcome
-            self.video_id = video_id
-            self.run_id = run_id
-            self.worker_id = worker_id
-            self.batch_number = batch_number
-            self.cursor = cursor
-            self.retry_attempt = retry_attempt
-            self.recovery_action = recovery_action
 
-logger = logging.getLogger(__name__)
+def _clean(value: Any, depth: int = 0) -> Any:
+    if depth > 4:
+        return "[TRUNCATED]"
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if value == value and abs(value) != float("inf") else None
+    if isinstance(value, str):
+        result = value[:1000]
+        for pattern in _SECRET_PATTERNS:
+            if pattern.pattern.startswith("(?i)(https?"):
+                result = pattern.sub(r"\1[REDACTED]@", result)
+            else:
+                result = pattern.sub(r"\1[REDACTED]", result)
+        return result
+    if isinstance(value, dict):
+        return {
+            str(key)[:80]: _clean(item, depth + 1)
+            for key, item in list(value.items())[:64]
+            if str(key).lower() not in {
+                "token", "mstoken", "cookie", "set-cookie", "authorization",
+                "password", "passwd", "proxy_pass", "api_key", "secret",
+                "credentials", "headers",
+            }
+        }
+    if isinstance(value, (list, tuple)):
+        return [_clean(item, depth + 1) for item in value[:64]]
+    return _clean(type(value).__name__, depth + 1)
 
 
 class DiagnosticsRecorder:
-    """Records diagnostics for failed HTTP or token operations.
+    """Append-only JSONL events plus a separate alert stream.
 
-    Every failed operation gets a structured diagnostic record that includes:
-    - UTC timestamp
-    - Run ID (unique per execution)
-    - Component and function where the error occurred
-    - Error code from the taxonomy
-    - HTTP status, where available
-    - Retry attempt number
-    - Recovery action taken
-    - Final outcome
-
-    No secrets (tokens, passwords, etc.) are ever recorded.
-
-    Persistence:
-    - Records can be serialized to JSONL format for storage across restarts.
-    - A single shared recorder instance should be used for consistent persistence.
-    - Writes are atomic per-record to prevent corruption.
-    - Failed write of a single record does not destroy previously recorded records.
+    A run is single-process by design; the lock serializes concurrent worker
+    threads. Each line is independently appended and files rotate at a fixed
+    size, so diagnostics storage does not grow without a bound.
     """
 
     def __init__(
         self,
-        run_id: Optional[str] = None,
-        jsonl_path: Optional[str] = None,
-    ):
-        self.run_id = run_id or str(uuid.uuid4())
-        self.jsonl_path = jsonl_path
-        self.records: List[Dict[str, Any]] = []
-        # Track if we've written to JSONL to avoid duplicate writes
-        # (each record triggers auto-write, but we only write once per line)
-        self._written_indices: set = set()
+        run_id: str | None = None,
+        jsonl_path: str | Path | None = None,
+        alert_path: str | Path | None = None,
+        max_bytes: int = 10 * 1024 * 1024,
+        backup_count: int = 5,
+    ) -> None:
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or not 64 * 1024 <= max_bytes <= 100 * 1024 * 1024:
+            raise ValueError("diagnostics max_bytes must be between 65536 and 104857600")
+        if isinstance(backup_count, bool) or not isinstance(backup_count, int) or not 1 <= backup_count <= 20:
+            raise ValueError("diagnostics backup_count must be between 1 and 20")
+        self.run_id = run_id or "unassigned"
+        self.jsonl_path = Path(jsonl_path) if jsonl_path else None
+        self.alert_path = Path(alert_path) if alert_path else (
+            self.jsonl_path.with_name(self.jsonl_path.stem.replace(".events", "") + ".alerts.jsonl")
+            if self.jsonl_path else None
+        )
+        self.max_bytes = max_bytes
+        self.backup_count = backup_count
+        self._lock = threading.RLock()
+        self._events = 0
+        self._alerts = 0
+        self._errors = 0
+        self._warnings = 0
+        self._event_counts: Counter[str] = Counter()
+        self._active_workers = 0
+        self._peak_workers = 0
+
+    def _rotate_if_needed(self, path: Path, incoming: int) -> None:
+        try:
+            current_size = path.stat().st_size
+        except FileNotFoundError:
+            current_size = 0
+        if current_size + incoming <= self.max_bytes:
+            return
+        oldest = path.with_name(path.name + f".{self.backup_count}")
+        oldest.unlink(missing_ok=True)
+        for index in range(self.backup_count - 1, 0, -1):
+            source = path.with_name(path.name + f".{index}")
+            if source.exists():
+                source.replace(path.with_name(path.name + f".{index + 1}"))
+        if path.exists():
+            path.replace(path.with_name(path.name + ".1"))
+
+    def _append(self, path: Path | None, payload: dict[str, Any]) -> None:
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
+        encoded = (json.dumps(_clean(payload), ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+        if len(encoded) > 64 * 1024:
+            raise ValueError("diagnostic record exceeds 64 KiB")
+        with self._lock:
+            self._rotate_if_needed(path, len(encoded))
+            descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                if hasattr(os, "fchmod"):
+                    try:
+                        os.fchmod(descriptor, 0o600)
+                    except OSError:
+                        pass
+                with os.fdopen(descriptor, "ab", closefd=False) as stream:
+                    stream.write(encoded)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            finally:
+                os.close(descriptor)
+
+    def record_event(self, event: str, severity: str = "INFO", component: str = "scraper", **fields: Any) -> dict[str, Any]:
+        if not isinstance(event, str) or not event.strip():
+            raise ValueError("diagnostic event name is required")
+        level = str(severity).upper()
+        if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError("invalid diagnostic severity")
+        safe_fields = {key: value for key, value in fields.items() if key in _ALLOWED_EVENT_FIELDS}
+        payload = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "run_id": self.run_id,
+            "event": event[:100],
+            "severity": level,
+            "component": component[:80],
+            **safe_fields,
+        }
+        payload = _clean(payload)
+        self._append(self.jsonl_path, payload)
+        with self._lock:
+            self._events += 1
+            self._event_counts[event[:100]] += 1
+            if level in {"ERROR", "CRITICAL"}:
+                self._errors += 1
+            elif level == "WARNING":
+                self._warnings += 1
+            if event == "video_started":
+                self._active_workers += 1
+                self._peak_workers = max(self._peak_workers, self._active_workers)
+            elif event == "video_finished":
+                self._active_workers = max(0, self._active_workers - 1)
+        return payload
+
+    def alert(self, code: str, severity: str, message: str, **fields: Any) -> dict[str, Any]:
+        level = str(severity).upper()
+        if level not in {"WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError("alerts must use WARNING, ERROR or CRITICAL severity")
+        safe_fields = {key: value for key, value in fields.items() if key in _ALLOWED_EVENT_FIELDS}
+        payload = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "run_id": self.run_id,
+            "alert_code": str(code)[:100],
+            "severity": level,
+            "message": str(message)[:500],
+            **safe_fields,
+        }
+        payload = _clean(payload)
+        self._append(self.alert_path, payload)
+        with self._lock:
+            self._alerts += 1
+        event_fields = dict(safe_fields)
+        event_fields.setdefault("error_code", code)
+        event_component = event_fields.pop("component", "alerting")
+        self.record_event("alert_raised", severity=level, component=event_component, **event_fields)
+        return payload
 
     def record_error(
-        self,
-        component: str,
-        function: str,
-        error: ScraperError,
-        retry_attempt: int = 0,
-        recovery_action: Optional[str] = None,
-        final_outcome: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Record a diagnostics entry for a failed operation.
+        self, component: str, function: str, error: Exception,
+        retry_attempt: int = 0, recovery_action: str | None = None,
+        final_outcome: str | None = None,
+    ) -> dict[str, Any]:
+        code = getattr(error, "error_code", "UNEXPECTED_INTERNAL_ERROR")
+        status = getattr(error, "http_status", None)
+        payload = self.record_event(
+            "operation_failed", severity="ERROR", component=component,
+            function=function, error_code=str(code), error_type=type(error).__name__,
+            http_status=status if isinstance(status, int) and 100 <= status <= 599 else None,
+            retry_attempt=max(0, int(retry_attempt or 0)),
+            stop_reason=final_outcome or recovery_action or "inspect_error_report",
+            video_id=getattr(error, "video_id", None),
+            worker_id=getattr(error, "worker_id", None),
+        )
+        self.alert(
+            str(code), "ERROR", "An operation failed; inspect the structured event record.",
+            component=component, function=function,
+            error_code=str(code), error_type=type(error).__name__,
+            http_status=status if isinstance(status, int) and 100 <= status <= 599 else None,
+            video_id=getattr(error, "video_id", None),
+            worker_id=getattr(error, "worker_id", None),
+        )
+        return payload
 
-        Args:
-            component: The component where the error occurred (e.g., "http_transport", "token_manager")
-            function: The function where the error occurred
-            error: The ScraperError instance containing all classification data
-            retry_attempt: The retry attempt number (0 if no retries)
-            recovery_action: The recovery action taken, or None
-            final_outcome: The final outcome (success, failed_permanent, retry_exhausted, etc.)
+    def record_from_exception(self, component: str, function: str, error: Exception, retry_attempt: int = 0, recovery_action: str | None = None) -> dict[str, Any]:
+        return self.record_error(component, function, error, retry_attempt, recovery_action)
 
-        Returns:
-            The diagnostics record dictionary.
-        """
-        record = {
-            "run_id": self.run_id,
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "component": component,
-            "function": function,
-            "error_code": error.error_code,
-            "severity": getattr(error.severity, "name", error.severity),
-            "http_status": error.http_status,
-            "retry_attempt": retry_attempt,
-            "recovery_action": recovery_action,
-            "final_outcome": getattr(
-                final_outcome or error.outcome,
-                "name",
-                final_outcome or error.outcome,
-            ),
-            "explanation": error.explanation,
-            "video_id": error.video_id,
-            "worker_id": error.worker_id,
-            "batch_number": error.batch_number,
-            "cursor": error.cursor,
-        }
+    def record_video_result(self, result: dict[str, Any], duration_seconds: float) -> None:
+        status = str(result.get("status", "unknown"))
+        recovery = result.get("recovery_budget") or {}
+        metrics = result.get("pagination_metrics") or {}
+        malformed = int(metrics.get("malformed_rejected") or 0)
+        retries = int(recovery.get("retries_used") or 0)
+        self.record_event(
+            "video_finished",
+            severity="INFO" if status == "completed" else "WARNING",
+            component="video_worker",
+            video_id=result.get("video_id"),
+            worker_id=result.get("worker_id"),
+            status=status,
+            stop_reason=result.get("stop_reason"),
+            duration_seconds=round(max(0.0, duration_seconds), 3),
+            total_comments=result.get("total_comments", 0),
+            total_batches=result.get("total_batches", 0),
+            records_received=result.get("records_received", 0),
+            valid_comments=result.get("valid_comments", 0),
+            duplicates_skipped=result.get("duplicates_skipped", 0),
+            malformed_records=malformed,
+            cache_error_count=len(result.get("cache_errors") or []),
+            pagination_outcome=result.get("pagination_outcome"),
+            retries_used=retries,
+            recovery_exhausted_reason=recovery.get("exhausted_reason"),
+        )
+        if status != "completed":
+            self.alert(
+                "VIDEO_INCOMPLETE", "ERROR" if status == "failed" else "WARNING",
+                "Video did not reach a completed pagination state.",
+                video_id=result.get("video_id"), worker_id=result.get("worker_id"),
+                status=status, stop_reason=result.get("stop_reason"),
+                pagination_outcome=result.get("pagination_outcome"),
+            )
+        if malformed:
+            self.alert(
+                "MALFORMED_RECORDS_QUARANTINED", "WARNING",
+                "Malformed source records were quarantined.",
+                video_id=result.get("video_id"), worker_id=result.get("worker_id"),
+                malformed_records=malformed,
+            )
+        if result.get("cache_errors"):
+            self.alert(
+                "CHECKPOINT_PERSISTENCE_ISSUE", "ERROR",
+                "One or more checkpoint persistence operations reported an error.",
+                video_id=result.get("video_id"), worker_id=result.get("worker_id"),
+                cache_error_count=len(result.get("cache_errors") or []),
+            )
+        if recovery.get("exhausted_reason"):
+            self.alert(
+                "RECOVERY_BUDGET_EXHAUSTED", "WARNING",
+                "The per-video recovery budget was exhausted.",
+                video_id=result.get("video_id"), worker_id=result.get("worker_id"),
+                retries_used=retries,
+                recovery_exhausted_reason=recovery.get("exhausted_reason"),
+            )
+        elif retries >= 8:
+            self.alert(
+                "RECOVERY_BUDGET_NEAR_LIMIT", "WARNING",
+                "The video consumed at least two-thirds of its retry allowance.",
+                video_id=result.get("video_id"), worker_id=result.get("worker_id"),
+                retries_used=retries,
+                retries_remaining=recovery.get("retries_remaining"),
+            )
 
-        # Ensure no secrets are in the explanation or any field
-        self._sanitize_record(record)
-
-        self.records.append(record)
-
-        # Automatically append to JSONL file if path is configured
-        self._auto_write_jsonl(record, len(self.records) - 1)
-
-        logger.debug("Diagnostics recorded: %s", record["error_code"])
-        return record
-
-    def _auto_write_jsonl(self, record: Dict[str, Any], index: int) -> None:
-        """Append a single record to JSONL file atomically.
-
-        Writes are per-record (single line) to prevent corruption.
-        A failed write for one record does not destroy previously written records.
-        """
-        if not self.jsonl_path:
-            return
-
-        # Only write each record once (track by index)
-        if index in self._written_indices:
-            return
-
-        try:
-            # Format the record as a single JSONL line
-            serializable = {
-                k: v for k, v in record.items() if not k.startswith("_")
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            snapshot = {
+                "events_written": self._events,
+                "alerts_written": self._alerts,
+                "errors": self._errors,
+                "warnings": self._warnings,
+                "active_workers": self._active_workers,
+                "peak_workers": self._peak_workers,
+                "event_counts": dict(self._event_counts),
+                "events_path": str(self.jsonl_path) if self.jsonl_path else None,
+                "alerts_path": str(self.alert_path) if self.alert_path else None,
             }
-            line = json.dumps(serializable, ensure_ascii=False) + "\n"
-
-            # Read existing content if file exists, then append
-            existing_lines: List[str] = []
+        if self.jsonl_path:
             try:
-                with open(self.jsonl_path, "r", encoding="utf-8") as f:
-                    existing_lines = f.readlines()
-            except FileNotFoundError:
-                pass  # File doesn't exist yet - that's OK
-            except PermissionError:
-                logger.warning("Permission denied writing diagnostics JSONL: %s", self.jsonl_path)
-                return
-            except OSError as e:
-                logger.warning("OS error reading diagnostics JSONL: %s", e)
-                return
-
-            # Append new line
-            existing_lines.append(line)
-
-            # Write all lines to temp file, then replace (atomic on POSIX)
-            temp_path = self.jsonl_path + ".tmp"
-            try:
-                with open(temp_path, "w", encoding="utf-8") as f:
-                    f.writelines(existing_lines)
-                os.replace(temp_path, self.jsonl_path)
-            except PermissionError:
-                logger.warning("Permission denied renaming diagnostics JSONL: %s", self.jsonl_path)
-            except OSError as e:
-                logger.warning("OS error renaming diagnostics JSONL: %s", e)
-            except Exception as e:
-                logger.warning("Unexpected error writing diagnostics JSONL: %s", e)
-
-            # Mark this index as written
-            self._written_indices.add(index)
-
-        except Exception as e:
-            # Never let a write failure destroy existing records or crash the caller
-            logger.warning("Unexpected error writing diagnostics JSONL: %s", e)
-
-    def get_records(self) -> List[Dict[str, Any]]:
-        """Return all recorded diagnostics records."""
-        return self.records
-
-    def to_jsonl(self) -> str:
-        """Convert all records to JSONL format for storage or transmission."""
-        lines = []
-        for record in self.records:
-            # Remove internal metadata before serialization
-            serializable = {k: v for k, v in record.items() if not k.startswith("_")}
-            lines.append(json.dumps(serializable, ensure_ascii=False))
-        return "\n".join(lines)
-
-    def _sanitize_record(self, record: Dict[str, Any]) -> None:
-        """Ensure no sensitive data appears in the diagnostics record.
-
-        This is a safety net to ensure tokens, passwords, or other
-        credentials never leak into diagnostics.
-        """
-        # These fields should never contain sensitive data, but sanitize anyway
-        sensitive_fields = ["explanation"]
-        for field in sensitive_fields:
-            if field in record and record[field]:
-                # Remove any potential token-like patterns
-                record[field] = self._redact_sensitive(record[field])
-
-        # Worker ID should be an integer or None, not a token
-        if "worker_id" in record and record["worker_id"] is not None:
-            if not isinstance(record["worker_id"], int):
-                record["worker_id"] = None
-
-        # Video ID should be a valid format or None
-        if "video_id" in record and record["video_id"]:
-            # Basic validation - video IDs are typically numeric or alphanumeric
-            # but not token-like
-            if len(record["video_id"]) > 50:
-                record["video_id"] = None
-
-    @staticmethod
-    def _redact_sensitive(text: str) -> str:
-        """Redact sensitive patterns from text.
-
-        This is a safety measure for the explanation field.
-        """
-        import re
-        # Remove patterns that look like tokens/keys
-        patterns = [
-            r'[a-zA-Z0-9]{40,}',  # Very long alphanumeric strings (potential tokens)
-            r'token=[^&\s]+',     # token=... in URLs
-            r'key=[^&\s]+',       # key=... in URLs
-            r'sb_publishable_[a-zA-Z0-9_-]+',  # Supabase publishable keys
-        ]
-        result = text
-        for pattern in patterns:
-            result = re.sub(pattern, '[REDACTED]', result)
-        return result
-
-    def record_from_exception(
-        self,
-        component: str,
-        function: str,
-        error: Exception,
-        retry_attempt: int = 0,
-        recovery_action: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Record diagnostics from a generic Exception.
-
-        Converts the exception to a ScraperError classification
-        and records the diagnostics.
-
-        Args:
-            component: The component where the error occurred
-            function: The function where the error occurred
-            error: The exception instance
-            retry_attempt: The retry attempt number
-
-        Returns:
-            The diagnostics record dictionary.
-        """
-        # Classify the error into our taxonomy
-        try:
-            from errors.classifiers import ErrorClassification
-            classification = self._classify_exception(error)
-        except ImportError:
-            # Fallback classification
-            classification = ErrorClassification(
-                error_code="UNEXPECTED_INTERNAL_ERROR",
-                severity="ERROR" if "ErrorSeverity" not in dir() else ErrorSeverity.ERROR,
-                explanation=str(error),
-                default_outcome="failed_permanent",
-                http_status=0,
-            )
-
-        # Use the fallback ScraperError if the real one isn't available
-        try:
-            from errors.model import ScraperError as RealScraperError
-            scraper_error = RealScraperError(
-                error_code=classification.error_code,
-                severity=classification.severity,
-                component=component,
-                function=function,
-                explanation=classification.explanation,
-                http_status=classification.http_status,
-                outcome=classification.default_outcome,
-                video_id=getattr(error, 'video_id', None),
-                worker_id=getattr(error, 'worker_id', None),
-                batch_number=getattr(error, 'batch_number', None),
-                cursor=getattr(error, 'cursor', None),
-                retry_attempt=retry_attempt,
-                recovery_action=recovery_action,
-            )
-        except ImportError:
-            # Create a minimal scraper error using the fallback class
-            scraper_error = type('ScraperError', (), {
-                'error_code': classification.error_code,
-                'severity': classification.severity,
-                'component': component,
-                'function': function,
-                'explanation': classification.explanation,
-                'http_status': classification.http_status,
-                'outcome': classification.default_outcome,
-                'video_id': getattr(error, 'video_id', None),
-                'worker_id': getattr(error, 'worker_id', None),
-                'batch_number': getattr(error, 'batch_number', None),
-                'cursor': getattr(error, 'cursor', None),
-                'retry_attempt': retry_attempt,
-                'recovery_action': recovery_action,
-            })()
-
-        return self.record_error(
-            component=component,
-            function=function,
-            error=scraper_error,
-            retry_attempt=retry_attempt,
-            recovery_action=recovery_action,
-            final_outcome=scraper_error.outcome,
-        )
-
-    def _classify_exception(self, error: Exception) -> ErrorClassification:
-        """Classify a generic exception into the error taxonomy."""
-        error_str = str(error).lower()
-
-        # Authentication indicators
-        auth_indicators = ["unauthorized", "invalid", "authentication", "forbidden", "401", "403"]
-        # Network indicators
-        network_indicators = ["timeout", "connection", "dns", "tls", "refused"]
-        # API/rate limit indicators
-        api_indicators = ["rate limit", "429", "quota", "too many requests"]
-
-        has_auth = any(indicator in error_str for indicator in auth_indicators)
-        has_network = any(indicator in error_str for indicator in network_indicators)
-        has_api = any(indicator in error_str for indicator in api_indicators)
-
-        if has_auth:
-            return ErrorClassification(
-                error_code="AUTHENTICATION_ERROR",
-                severity="ERROR",
-                explanation="Operation authentication failed",
-                default_outcome="failed_permanent",
-                http_status=401,
-            )
-        if has_api:
-            return ErrorClassification(
-                error_code="RATE_LIMITED",
-                severity="WARNING",
-                explanation="Operation rate-limited by API",
-                default_outcome="failed_resumable",
-                http_status=429,
-            )
-        if has_network:
-            return ErrorClassification(
-                error_code="NETWORK_ERROR",
-                severity="WARNING",
-                explanation="Operation network failure",
-                default_outcome="failed_resumable",
-                http_status=0,
-            )
-
-        # Default
-        return ErrorClassification(
-            error_code="UNEXPECTED_INTERNAL_ERROR",
-            severity="ERROR",
-            explanation="Unknown error occurred",
-            default_outcome="failed_permanent",
-            http_status=0,
-        )
+                usage = shutil.disk_usage(self.jsonl_path.parent)
+                snapshot.update({
+                    "disk_free_bytes": usage.free,
+                    "disk_total_bytes": usage.total,
+                    "disk_usage_percent": round((usage.used / usage.total) * 100, 2) if usage.total else None,
+                })
+            except OSError:
+                snapshot["disk_usage_unavailable"] = True
+        return snapshot

@@ -263,7 +263,7 @@ def export_run_results(results: list, run_id: str | None = None, run_metadata: d
 
 
 def scrape_videos_and_export(video_jobs: list, max_workers: int = 3, run_id: str | None = None, run_control: RunControl | None = None) -> dict:
-    """Run bounded video work with cooperative stop and isolated outcomes."""
+    """Run bounded video work and persist structured operational telemetry."""
     if not isinstance(video_jobs, list):
         raise TypeError("video_jobs must be a list")
     if isinstance(max_workers, bool) or not isinstance(max_workers, int) or not 1 <= max_workers <= 16:
@@ -289,9 +289,19 @@ def scrape_videos_and_export(video_jobs: list, max_workers: int = 3, run_id: str
         seen_video_ids.add(video_id)
         normalized_jobs.append((video_id, author))
 
+    from config import (
+        ERROR_REPORT_DIR, MAX_RUN_COMMENTS, MINIMUM_FREE_BYTES,
+        DIAGNOSTICS_MAX_BYTES, DIAGNOSTICS_BACKUP_COUNT,
+    )
     if run_control is None:
-        from config import MAX_RUN_COMMENTS
         run_control = RunControl(max_comments=MAX_RUN_COMMENTS)
+    events_path = ERROR_REPORT_DIR / f"run_{run_id}.events.jsonl"
+    alerts_path = ERROR_REPORT_DIR / f"run_{run_id}.alerts.jsonl"
+    monitor = DiagnosticsRecorder(
+        run_id=run_id, jsonl_path=events_path, alert_path=alerts_path,
+        max_bytes=DIAGNOSTICS_MAX_BYTES, backup_count=DIAGNOSTICS_BACKUP_COUNT,
+    )
+    run_started = time.monotonic()
     results_by_index = {}
     next_index = 0
     max_pending = max_workers * 2
@@ -304,7 +314,25 @@ def scrape_videos_and_export(video_jobs: list, max_workers: int = 3, run_id: str
             "status": "partial", "stop_reason": reason, "comments": [],
         }
 
+    health = monitor.snapshot()
+    if health.get("disk_free_bytes") is not None and health["disk_free_bytes"] < MINIMUM_FREE_BYTES:
+        monitor.alert(
+            "LOW_DISK_SPACE", "ERROR",
+            "Available disk space is below the configured minimum threshold.",
+            disk_free_bytes=health["disk_free_bytes"],
+            disk_total_bytes=health.get("disk_total_bytes"),
+        )
+    monitor.record_event(
+        "run_started", component="run_coordinator",
+        requested_video_jobs=len(normalized_jobs), max_workers=max_workers,
+        max_pending_jobs=max_pending, max_run_comments=run_control.max_comments,
+        disk_free_bytes=health.get("disk_free_bytes"),
+        disk_total_bytes=health.get("disk_total_bytes"),
+        disk_usage_percent=health.get("disk_usage_percent"),
+    )
+
     with scraper_run_lock(CACHE_DIR, timeout=0.0):
+        monitor.record_event("run_lock_acquired", component="run_coordinator")
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="tiktok-video") as executor:
             pending = {}
 
@@ -316,9 +344,13 @@ def scrape_videos_and_export(video_jobs: list, max_workers: int = 3, run_id: str
                     index = next_index
                     next_index += 1
                     video_id, author = normalized_jobs[index]
+                    monitor.record_event(
+                        "video_queued", component="run_coordinator",
+                        video_id=video_id, worker_id=index + 1,
+                    )
                     future = executor.submit(
                         scrape_video_comments, video_id, author, index + 1,
-                        run_id, run_control,
+                        run_id, run_control, monitor,
                     )
                     pending[future] = index
 
@@ -353,6 +385,14 @@ def scrape_videos_and_export(video_jobs: list, max_workers: int = 3, run_id: str
                             "error_type": type(error).__name__, "cache_recovery_error": recovery_error,
                             "comments": recovered_comments,
                         }
+                        monitor.record_event(
+                            "worker_result_recovered", severity="ERROR", component="run_coordinator",
+                            video_id=video_id, worker_id=index + 1, status="failed",
+                            stop_reason="unhandled_video_worker_exception",
+                            error_code=getattr(error, "error_code", "UNEXPECTED_INTERNAL_ERROR"),
+                            error_type=type(error).__name__,
+                            cache_error_count=1 if recovery_error else 0,
+                        )
 
                 if run_control.is_stopped():
                     for future, index in list(pending.items()):
@@ -369,43 +409,120 @@ def scrape_videos_and_export(video_jobs: list, max_workers: int = 3, run_id: str
         results_by_index.get(index, interrupted_result(index, "worker_result_unavailable"))
         for index in range(len(normalized_jobs))
     ]
-    outputs = export_run_results(
-        results, run_id=run_id,
-        run_metadata={
-            "max_workers": max_workers,
-            "max_pending_jobs": max_pending,
-            "requested_video_jobs": len(normalized_jobs),
-            "interrupted": run_control.is_stopped(),
-            "stop_reason": run_control.stop_reason,
-            "max_run_comments": run_control.max_comments,
-            "comments_reserved": run_control.comments_reserved,
-        },
+    completed_count = sum(1 for item in results if item.get("status") == "completed")
+    failed_count = sum(1 for item in results if item.get("status") == "failed")
+    partial_count = len(results) - completed_count - failed_count
+    total_comments = sum(int(item.get("total_comments") or 0) for item in results)
+    monitor.record_event(
+        "run_results_aggregated",
+        severity="INFO" if completed_count == len(results) else "WARNING",
+        component="run_coordinator",
+        requested_video_jobs=len(results), completed_videos=completed_count,
+        partial_videos=partial_count, failed_videos=failed_count,
+        total_comments=total_comments, comments_reserved=run_control.comments_reserved,
+        max_run_comments=run_control.max_comments,
+        duration_seconds=round(time.monotonic() - run_started, 3),
+        stop_reason=run_control.stop_reason,
+    )
+    if run_control.is_stopped():
+        monitor.alert(
+            "RUN_STOPPED", "WARNING",
+            "The run stopped before all requested work completed.",
+            stop_reason=run_control.stop_reason,
+            requested_video_jobs=len(results), completed_videos=completed_count,
+            partial_videos=partial_count, failed_videos=failed_count,
+        )
+    if partial_count or failed_count:
+        monitor.alert(
+            "RUN_INCOMPLETE", "WARNING",
+            "One or more video jobs did not reach a completed state.",
+            requested_video_jobs=len(results), completed_videos=completed_count,
+            partial_videos=partial_count, failed_videos=failed_count,
+        )
+
+    monitor_snapshot = monitor.snapshot()
+    try:
+        outputs = export_run_results(
+            results, run_id=run_id,
+            run_metadata={
+                "max_workers": max_workers, "max_pending_jobs": max_pending,
+                "requested_video_jobs": len(normalized_jobs),
+                "interrupted": run_control.is_stopped(),
+                "stop_reason": run_control.stop_reason,
+                "max_run_comments": run_control.max_comments,
+                "comments_reserved": run_control.comments_reserved,
+                "monitoring": monitor_snapshot,
+            },
+        )
+    except Exception as error:
+        monitor.record_error("output_writer", "export_run_results", error)
+        raise
+
+    monitor.record_event(
+        "run_outputs_written", component="output_writer",
+        output_dir=outputs.get("output_dir"), summary_path=outputs.get("summary_path"),
+        json_path=outputs.get("json_path"), csv_path=outputs.get("csv_path"),
+        total_comments=outputs.get("total_comments"),
+    )
+    monitor.record_event(
+        "run_finished", component="run_coordinator",
+        severity="INFO" if completed_count == len(results) else "WARNING",
+        requested_video_jobs=len(results), completed_videos=completed_count,
+        partial_videos=partial_count, failed_videos=failed_count,
+        total_comments=total_comments,
+        duration_seconds=round(time.monotonic() - run_started, 3),
+        stop_reason=run_control.stop_reason,
     )
     return {
         "run_id": run_id, "results": results, "outputs": outputs,
         "interrupted": run_control.is_stopped(), "stop_reason": run_control.stop_reason,
+        "monitoring": monitor.snapshot(),
     }
 
 
-def scrape_video_comments(video_id: str, video_author: str, worker_id: int, run_id: str | None = None, run_control: RunControl | None = None) -> dict:
-    """Serialize ownership of a video's checkpoint across threads and processes."""
+def scrape_video_comments(
+    video_id: str, video_author: str, worker_id: int,
+    run_id: str | None = None, run_control: RunControl | None = None,
+    monitor: DiagnosticsRecorder | None = None,
+) -> dict:
+    """Serialize checkpoint ownership and emit one bounded lifecycle record."""
     run_control = run_control or RunControl()
+    started = time.monotonic()
+    if monitor:
+        monitor.record_event("video_started", component="video_worker", video_id=str(video_id), worker_id=worker_id)
     try:
         with video_checkpoint_lock(CACHE_DIR, str(video_id), timeout=30.0):
-            return _scrape_video_comments_locked(video_id, video_author, worker_id, run_id=run_id, run_control=run_control)
+            result = _scrape_video_comments_locked(
+                video_id, video_author, worker_id, run_id=run_id,
+                run_control=run_control,
+            )
     except TimeoutError as lock_error:
-        return {
+        result = {
             "video_id": str(video_id), "author": video_author, "worker_id": worker_id,
             "total_comments": 0, "total_batches": 0, "tokens_used": 0,
             "proxy_rotations": 0, "duplicates_skipped": 0, "invalid_missing_ids": 0,
             "status": "partial", "stop_reason": "video_checkpoint_lock_unavailable",
-            "cache_errors": [str(lock_error)], "pagination_outcome": "LOCKED",
+            "cache_errors": [type(lock_error).__name__], "pagination_outcome": "LOCKED",
             "pagination_metrics": {}, "recovery_budget": {},
             "malformed_comments": [], "malformed_comments_path": None,
             "records_received": 0, "valid_comments": 0, "new_comments": 0,
-            "normalization_anomalies": {},
-            "comments": [],
+            "normalization_anomalies": {}, "comments": [],
         }
+    except Exception as error:
+        if monitor:
+            monitor.record_error("video_worker", "scrape_video_comments", error)
+            monitor.record_event(
+                "video_finished", severity="ERROR", component="video_worker",
+                video_id=str(video_id), worker_id=worker_id, status="failed",
+                stop_reason="unhandled_video_worker_exception",
+                error_code=getattr(error, "error_code", "UNEXPECTED_INTERNAL_ERROR"),
+                error_type=type(error).__name__,
+                duration_seconds=round(time.monotonic() - started, 3),
+            )
+        raise
+    if monitor:
+        monitor.record_video_result(result, time.monotonic() - started)
+    return result
 
 
 def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: int, run_id: str | None = None, run_control: RunControl | None = None) -> dict:
@@ -734,6 +851,11 @@ def main() -> int:
     safe_print(f"JSON: {outputs['json_path']}")
     safe_print(f"CSV: {outputs['csv_path']}")
     safe_print(f"Summary: {outputs['summary_path']}")
+    monitoring = run_result.get("monitoring") or {}
+    if monitoring.get("events_path"):
+        safe_print(f"Events: {monitoring['events_path']}")
+    if monitoring.get("alerts_path"):
+        safe_print(f"Alerts: {monitoring['alerts_path']}")
     if run_result.get("interrupted"):
         stop_reason = run_result.get("stop_reason")
         safe_print(f"Run stopped: {stop_reason}")
