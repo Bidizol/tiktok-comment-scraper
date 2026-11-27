@@ -17,23 +17,25 @@ BASE_DIR = Path(__file__).parent
 # Load .env file from the project root if it exists
 ENV_PATH = BASE_DIR / ".env"
 if ENV_PATH.exists():
-    with open(ENV_PATH) as env_file:
+    with open(ENV_PATH, encoding="utf-8") as env_file:
         for env_line in env_file:
             line = env_line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-            env_key, env_value = line.split('=', 1)
+            env_key, env_value = line.split("=", 1)
             env_key = env_key.strip()
             if env_key.startswith("export "):
                 env_key = env_key[7:].strip()
-                env_value = env_value.strip()
-                if len(env_value) >= 2 and env_value[0] == env_value[-1] and env_value[0] in {"'", '"'}:
-                    env_value = env_value[1:-1]
-                else:
-                    env_value = env_value.split(" #", 1)[0].strip()
-                # Process environment always takes precedence over the .env file.
-                if env_key not in os.environ:
-                    os.environ[env_key] = env_value
+            if not env_key:
+                continue
+            env_value = env_value.strip()
+            if len(env_value) >= 2 and env_value[0] == env_value[-1] and env_value[0] in {"'", '"'}:
+                env_value = env_value[1:-1]
+            else:
+                env_value = env_value.split(" #", 1)[0].strip()
+            # Process environment always takes precedence over the .env file.
+            if env_key not in os.environ:
+                os.environ[env_key] = env_value
 
 # Proxy configuration
 PROXY_HOST: str = os.environ.get("PROXY_HOST", "")
