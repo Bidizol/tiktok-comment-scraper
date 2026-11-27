@@ -35,3 +35,7 @@ scraper_comments.csv
 # New application runtime data
 /data/
 /reports/
+
+# Container and local deployment runtime data
+/runtime/
+/backups/

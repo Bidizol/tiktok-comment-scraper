@@ -55,7 +55,7 @@ from cache_safety import (
 # Configuration
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 MAX_RETRIES = 3
-from config import MAX_COMMENTS as CONFIG_MAX_COMMENTS
+from config import CACHE_DIR, MAX_COMMENTS as CONFIG_MAX_COMMENTS
 MAX_COMMENTS = CONFIG_MAX_COMMENTS
 COMMENTS_PER_BATCH = 50
 
@@ -75,9 +75,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Directorio para cache
-CACHE_DIR = Path(__file__).parent / "cache"
-CACHE_DIR.mkdir(exist_ok=True)
 
 # Lock para print thread-safe
 print_lock = threading.Lock()
@@ -843,11 +840,15 @@ def main() -> int:
         safe_print(f"Invalid run resource configuration: {type(error).__name__}")
         return 2
     previous_sigint_handler = signal.getsignal(signal.SIGINT)
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
 
     def request_graceful_stop(signum, frame):
-        run_control.request_stop("keyboard_interrupt")
+        reason = "termination_signal" if signum == signal.SIGTERM else "keyboard_interrupt"
+        run_control.request_stop(reason)
+        logger.warning("Graceful shutdown requested (%s)", reason)
 
     signal.signal(signal.SIGINT, request_graceful_stop)
+    signal.signal(signal.SIGTERM, request_graceful_stop)
     try:
         run_result = scrape_videos_and_export(TEST_VIDEOS, max_workers=MAX_WORKERS, run_id=None, run_control=run_control)
     except KeyboardInterrupt:
@@ -860,6 +861,7 @@ def main() -> int:
         return 1
     finally:
         signal.signal(signal.SIGINT, previous_sigint_handler)
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
     outputs = run_result["outputs"]
     safe_print(f"Run ID: {run_result['run_id']}")
     safe_print(f"Videos: {outputs['total_videos']} | Comments: {outputs['total_comments']}")
