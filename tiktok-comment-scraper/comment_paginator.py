@@ -151,7 +151,14 @@ class CommentPaginator:
                         "max_comments_reached",
                     )
 
-                current_token = mstoken() if callable(mstoken) else mstoken
+                try:
+                    current_token = mstoken() if callable(mstoken) else mstoken
+                except Exception as token_error:
+                    return self._finish(
+                        PaginatorOutcome.FAILED, PaginationState.FAILED,
+                        "token_refresh_failed",
+                        self._error("TOKEN_REFRESH_ERROR", type(token_error).__name__),
+                    )
                 if not isinstance(current_token, str) or not current_token:
                     return self._finish(
                         PaginatorOutcome.FAILED, PaginationState.FAILED,
