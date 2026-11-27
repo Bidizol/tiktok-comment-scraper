@@ -79,87 +79,43 @@ class HTTPTransport:
         connect_timeout: Optional[int] = None,
         read_timeout: Optional[int] = None,
         overall_timeout: Optional[int] = None,
-    ):
-        """Execute an HTTP request with full error classification.
+    ) -> Tuple[int, Optional[Dict[str, Any]]]:
+        """Execute one HTTP request and return (status, parsed JSON object).
 
-        Returns a tuple of (http_status, parsed_json_or_none).
-        On non-2xx responses, http_status is set and json_or_none is None.
-        On network errors, http_status is 0 and json_or_none is None.
-
-        Raises ScraperError on unrecoverable classification failures.
+        urllib exposes a single socket timeout, so overall_timeout is used when
+        supplied. connect_timeout/read_timeout remain accepted for API
+        compatibility; separate phase timeouts require a different transport.
+        HTTP, network, and malformed-JSON failures return a status and None.
         """
+        timeout = overall_timeout if overall_timeout is not None else self.overall_timeout
+        request = urllib.request.Request(
+            url, method=method, headers=headers or {}, data=body
+        )
         try:
-            req = urllib.request.Request(url, method=method, headers=headers or {}, data=body)
-            # urllib exposes one socket timeout rather than separate connect/read
-            # controls. Use the explicitly supplied overall timeout when present.
-            timeout = overall_timeout if overall_timeout is not None else self.overall_timeout
-            url_open = urllib.request.urlopen(req, timeout=timeout)
-            status_code = url_open.getcode()
-            raw_body = url_open.read()
-            try:
-                parsed = json.loads(raw_body.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError) as error:
-                if classify_json_error:
-                    classification = classify_json_error(str(error))
-                else:
-                    classification = ErrorClassification(
-                        error_code="JSON_DECODE_ERROR",
-                        severity=ErrorSeverity.ERROR if ErrorSeverity else "ERROR",
-                        explanation="Invalid JSON response",
-                        default_outcome=ErrorOutcome.FAILED_PERMENET if ErrorOutcome else "failed_permanent",
-                        http_status=0,
-                    )
-                raise ScraperError(
-                    error_code=classification.error_code,
-                    severity=classification.severity,
-                    component="http_transport",
-                    function="request",
-                    explanation=classification.explanation,
-                    http_status=status_code,
-                    outcome=classification.default_outcome,
-                )
-            return status_code, parsed
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status_code = response.getcode()
+                raw_body = response.read()
+        except urllib.error.HTTPError as error:
+            logger.warning("HTTP request failed with status %s", error.code)
+            return int(error.code), None
+        except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as error:
+            logger.warning("HTTP request failed (%s)", type(error).__name__)
+            return 0, None
 
-        except Exception as error:
-            # Try to classify the error
-            if hasattr(error, 'code') and classify_http_error:
-                status_code = error.code
-                classification = classify_http_error(status_code)
-                raise ScraperError(
-                    error_code=classification.error_code,
-                    severity=classification.severity,
-                    component="http_transport",
-                    function="request",
-                    explanation=classification.explanation,
-                    http_status=status_code,
-                    outcome=classification.default_outcome,
-                )
-            elif hasattr(error, 'reason') and classify_dns_error:
-                error_str = str(error)
-                if isinstance(error.reason, socket.gaierror):
-                    classification = classify_dns_error(error_str)
-                else:
-                    classification = classify_tls_error(error_str)
-                raise ScraperError(
-                    error_code=classification.error_code,
-                    severity=classification.severity,
-                    component="http_transport",
-                    function="request",
-                    explanation=classification.explanation,
-                    http_status=0,
-                    outcome=classification.default_outcome,
-                )
-            else:
-                # Generic error
-                raise ScraperError(
-                    error_code="NETWORK_ERROR",
-                    severity=ErrorSeverity.ERROR if ErrorSeverity else "ERROR",
-                    component="http_transport",
-                    function="request",
-                    explanation=str(error),
-                    http_status=0,
-                    outcome=ErrorOutcome.FAILED_PERMANENT if ErrorOutcome else "failed_permanent",
-                )
+        try:
+            parsed = json.loads(raw_body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            logger.warning("Invalid JSON response (status %s): %s", status_code, error)
+            return int(status_code or 0), None
+
+        if not isinstance(parsed, dict):
+            logger.warning(
+                "Expected JSON object (status %s), received %s",
+                status_code,
+                type(parsed).__name__,
+            )
+            return int(status_code or 0), None
+        return int(status_code or 0), parsed
 
     def safe_json_decode(
         self, raw_body: bytes, http_status: int
