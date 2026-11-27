@@ -88,3 +88,10 @@ Optional settings:
 - `DIAGNOSTICS_MAX_BYTES` (64 KiB–100 MiB; defaults to 10 MiB)
 - `DIAGNOSTICS_BACKUP_COUNT` (1–20 retained backups; defaults to 5)
 - `MINIMUM_FREE_BYTES` (minimum free-disk threshold; defaults to 100 MiB and raises a run alert below the threshold)
+
+
+## Platform adapter boundary
+
+The pagination engine delegates source-specific work through the `PlatformAdapter` contract in `platform_adapters/base.py`. The contract covers resource-ID rules, page retrieval, source-record recognition, minimum-content rules, comment identity, normalization and normalization-anomaly reporting. The current implementation is `TikTokAdapter` in `platform_adapters/tiktok.py`; it owns the TikTok endpoint, query parameters, response envelope, source field names and normalized-record conversion.
+
+The active command and checkpoint identity remain TikTok-specific. No other platform adapter is currently included or advertised as supported. A future platform integration must implement the adapter contract and separately define its authentication, pagination semantics, durable identity and operational limits before it can be enabled.

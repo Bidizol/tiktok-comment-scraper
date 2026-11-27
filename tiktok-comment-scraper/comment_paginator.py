@@ -9,9 +9,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import urlencode
-
-from http_transport import HTTPTransport, HTTPTransportError
+from http_transport import HTTPTransport
+from platform_adapters import PlatformAdapter, TikTokAdapter
 from pagination_state import CursorIntegrityChecker, PaginationMetadata, PaginationState, normalise_has_more
 from errors.model import ScraperError, ErrorOutcome, ErrorSeverity
 
@@ -47,13 +46,6 @@ class PaginationStop(Exception):
     """A caller-requested resource boundary reached while processing a page."""
 
 
-# A comment may legitimately omit cid; text is sufficient to preserve it as a
-# comment record while the missing identifier is tracked independently.
-COMMENT_SCHEMA_KEYS = frozenset({
-    "cid", "text", "create_time", "user", "user_id", "aweme_id",
-    "reply_id", "digg_count", "status", "stick_position", "reply_comment",
-})
-
 @dataclass
 class PaginatorResult:
     outcome: PaginatorOutcome
@@ -82,7 +74,7 @@ class CommentPaginator:
         stalled_timeout_seconds: int = DEFAULT_STALLED_TIMEOUT_SECONDS,
         elapsed_timeout_seconds: int = DEFAULT_ELAPSED_TIMEOUT_SECONDS,
         transport: Optional[HTTPTransport] = None, retry_budget: Any = None,
-        stop_event: Any = None,
+        stop_event: Any = None, adapter: Optional[PlatformAdapter] = None,
     ):
         limits = {
             "max_batches": max_batches, "max_comments": max_comments,
@@ -95,10 +87,10 @@ class CommentPaginator:
         if invalid:
             raise ValueError("Pagination limits must be positive: " + ", ".join(invalid))
         if not isinstance(video_id, (str, int)) or isinstance(video_id, bool):
-            raise ValueError("video_id must be a non-empty TikTok video identifier")
+            raise ValueError("resource identifier must be a non-empty string or integer")
         normalized_video_id = str(video_id).strip()
-        if not normalized_video_id.isdigit() or len(normalized_video_id) > 32:
-            raise ValueError("video_id must contain 1-32 decimal digits")
+        if not normalized_video_id or len(normalized_video_id) > 128:
+            raise ValueError("resource identifier must contain 1-128 characters")
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
 
@@ -113,6 +105,13 @@ class CommentPaginator:
         self.transport = transport or HTTPTransport()
         self.retry_budget = retry_budget
         self.stop_event = stop_event
+        self.adapter = adapter or TikTokAdapter(
+            transport=self.transport, video_id=self.video_id,
+            run_id=self.run_id, retry_budget=self.retry_budget,
+        )
+        if not isinstance(self.adapter, PlatformAdapter):
+            raise TypeError("adapter must implement PlatformAdapter")
+        self.adapter.validate_resource_id(self.video_id)
         self.cursor_checker = CursorIntegrityChecker(
             max_cycle_detections=max(5000, self.max_batches + 1),
             max_consecutive_empty=self.max_consecutive_empty,
@@ -126,26 +125,6 @@ class CommentPaginator:
             records_returned=0, valid_comments_extracted=0, duplicate_comments=0,
             malformed_rejected=0, has_more=True,
         )
-
-    @staticmethod
-    def _comment_shape_is_recognized(comment: dict) -> bool:
-        return bool(COMMENT_SCHEMA_KEYS.intersection(comment.keys()))
-
-    @staticmethod
-    def _has_comment_id(comment: dict) -> bool:
-        cid = comment.get("cid")
-        if isinstance(cid, bool):
-            return False
-        if isinstance(cid, int):
-            return cid >= 0
-        return isinstance(cid, str) and bool(cid.strip())
-
-    @staticmethod
-    def _has_minimum_content(comment: dict) -> bool:
-        if "text" not in comment:
-            return False
-        value = comment.get("text")
-        return isinstance(value, (str, int, float)) and not isinstance(value, bool)
 
     def run(
         self, *, initial_cursor: int = 0, mstoken: Any,
@@ -279,7 +258,7 @@ class CommentPaginator:
                                     malformed_records,
                                 )
                         continue
-                    if not self._comment_shape_is_recognized(record):
+                    if not self.adapter.is_comment_record(record):
                         reason = "unrecognized_comment_schema"
                         remember_malformed(record)
                         malformed_count += 1
@@ -294,7 +273,7 @@ class CommentPaginator:
                                     malformed_records,
                                 )
                         continue
-                    if not self._has_minimum_content(record):
+                    if not self.adapter.has_minimum_content(record):
                         reason = "comment_text_missing_or_invalid"
                         remember_malformed(record)
                         malformed_count += 1
@@ -310,7 +289,7 @@ class CommentPaginator:
                                 )
                         continue
                     usable_comment_records += 1
-                    if not self._has_comment_id(record):
+                    if not self.adapter.has_comment_id(record):
                         missing_id_count += 1
                     try:
                         callback_result = on_comment(record) if on_comment is not None else True
@@ -470,51 +449,8 @@ class CommentPaginator:
         )
 
     def _fetch_batch(self, *, cursor: int, mstoken: str) -> Dict[str, Any]:
-        query = urlencode({
-            "aid": "1988", "aweme_id": self.video_id, "count": "50",
-            "cursor": str(cursor), "msToken": mstoken,
-        })
-        url = "https://www.tiktok.com/api/comment/list/?" + query
-        try:
-            response = self.transport.request_with_retry(
-                "GET", url,
-                retry_budget=self.retry_budget,
-                retry_component=("proxy" if self.transport.proxy_url else "http"),
-                headers={
-                    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "referer": "https://www.tiktok.com/",
-                },
-                expect_json=True,
-                maximum_attempts=self.transport.max_retries,
-            )
-        except HTTPTransportError as transport_error:
-            outcome = (ErrorOutcome.RETRY_EXHAUSTED if transport_error.error_code == "RETRY_EXHAUSTED"
-                       else ErrorOutcome.FAILED_RESUMABLE if transport_error.retryable
-                       else ErrorOutcome.FAILED_PERMANENT)
-            raise self._error(
-                transport_error.error_code, str(transport_error),
-                http_status=transport_error.http_status, outcome=outcome,
-            ) from transport_error
-
-        data = response.json_data
-        if not isinstance(data, dict):
-            return {"schema_error": "response_not_object"}
-        api_status = data.get("status_code")
-        if api_status not in (None, 0, "0"):
-            return {"error": True}
-        if "comments" not in data:
-            return {"schema_error": "comments_field_missing"}
-        if "has_more" not in data:
-            return {"schema_error": "has_more_field_missing"}
-        if "cursor" not in data and data.get("has_more") in (True, 1, "1"):
-            return {"schema_error": "cursor_field_missing"}
-        return {
-            "http_status": response.status_code,
-            "comments": data.get("comments"),
-            "has_more": data.get("has_more"),
-            "next_cursor": data.get("cursor"),
-            "error": None,
-        }
+        """Delegate platform I/O and response translation to the selected adapter."""
+        return self.adapter.fetch_page(cursor=cursor, token=mstoken)
 
     def _error(
         self, code: str, explanation: str, http_status: Optional[int] = None,

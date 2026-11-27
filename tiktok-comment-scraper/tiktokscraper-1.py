@@ -25,6 +25,7 @@ from recovery_budget import RecoveryBudget
 from run_control import RunControl
 from diagnostics import DiagnosticsRecorder
 from comment_schema import normalize_comment_record, safe_source_payload
+from platform_adapters import TikTokAdapter
 from output_writer import write_run_outputs
 
 from errors.model import ScraperError, ErrorSeverity, ErrorOutcome
@@ -583,6 +584,10 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
         maximum_proxy_retries=2,
     )
     token_manager = TokenManager(worker_id, transport=transport, retry_budget=recovery_budget)
+    platform_adapter = TikTokAdapter(
+        transport=transport, video_id=str(video_id), run_id=run_id,
+        retry_budget=recovery_budget,
+    )
 
     cached = load_cache(worker_id, video_id)
     if cached and cached.get("is_complete", False):
@@ -681,18 +686,12 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
         if not isinstance(comment, dict):
             invalid_missing_ids += 1
             return False
-        normalized = normalize_comment_record(video_id, comment)
+        normalized = platform_adapter.normalize_comment(video_id, comment)
         if normalized["comment_id"] is None:
             invalid_missing_ids += 1
-        raw_timestamp = comment.get("create_time", comment.get("createTime"))
-        raw_likes = comment.get("digg_count", comment.get("like_count"))
-        raw_replies = comment.get("reply_comment_total", comment.get("reply_count"))
-        if normalized["created_at_epoch"] is None and raw_timestamp is not None:
-            normalization_anomalies["invalid_timestamp"] += 1
-        if normalized["likes"] is None and raw_likes is not None:
-            normalization_anomalies["invalid_like_count"] += 1
-        if normalized["reply_count"] is None and raw_replies is not None:
-            normalization_anomalies["invalid_reply_count"] += 1
+        for anomaly, count in platform_adapter.normalization_anomalies(comment, normalized).items():
+            if anomaly in normalization_anomalies:
+                normalization_anomalies[anomaly] += count
         dedupe_key = normalized.get("dedupe_key")
         legacy_id_key = normalized.get("comment_id")
         if dedupe_key is not None and (
@@ -751,6 +750,7 @@ def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: i
             transport=transport,
             retry_budget=recovery_budget,
             stop_event=run_control.stop_event,
+            adapter=platform_adapter,
         )
         pagination_result = paginator.run(
             initial_cursor=cursor,
