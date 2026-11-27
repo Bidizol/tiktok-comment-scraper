@@ -40,7 +40,7 @@ from pagination_state import normalise_has_more, PaginationState, PaginationMeta
 # Cache safety – single shared read-modify-write implementation.
 # Imported from cache_safety so there is no second competing cache implementation.
 sys.path.insert(0, str(Path(__file__).parent))
-from cache_safety import save_and_load_cache_safe, cleanup_orphan_temp_files  # noqa: E402
+from cache_safety import save_and_load_cache_safe, cleanup_orphan_temp_files, load_cache_safe  # noqa: E402
 
 # Configuration
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -249,19 +249,18 @@ def load_cache(worker_id: int, video_id: str) -> dict | None:
     if not cache_file.exists():
         return None
 
-    try:
-        with open(cache_file, "r", encoding="utf-8") as f:
-            cached = json.load(f)
-    except (json.JSONDecodeError, Exception) as e:
-        safe_print(f"[W{worker_id}] Cache corrupto o ilegible: {cache_file}: {e}")
-        # Preserve the corrupt cache file - don't overwrite it
+    cached, cache_status = load_cache_safe(CACHE_DIR, worker_id, video_id)
+    if cached is None:
+        safe_print(f"[W{worker_id}] Cache no disponible o ilegible: {cache_file}: {cache_status}")
         return None
 
-    # Phase 5 Block 3.1: Cache identity validation — reject invalid/mismatched
-    # caches before they are loaded. Recoverable data is preserved on disk
-    # (and quarantined on the next write via save_and_load_cache_safe).
+    if cached.get("_quarantined"):
+        safe_print(f"[W{worker_id}] Cache preservado en cuarentena: {cache_status}")
+        return None
+
+    # Phase 5 Block 3.1: Verify identity and structure after the locked read.
     if not validate_cache_identity(cached, video_id, worker_id):
-        safe_print(f"[W{worker_id}] Cache inválido o identidad no coincidente: {cache_file} (video_id={video_id}, worker_id={worker_id})")
+        safe_print(f"[W{worker_id}] Cache inválido: {cache_file} ({cache_status})")
         return None
 
     # Validate the cached data
