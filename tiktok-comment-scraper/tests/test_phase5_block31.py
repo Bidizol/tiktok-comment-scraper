@@ -68,7 +68,7 @@ def _install_mock_transport(monkeypatch, responses):
             return responses[idx]
         return (200, {"comments": [], "has_more": False, "cursor": 0, "http_status": 200, "error": None})
 
-    monkeypatch.setattr(http_transport.HTTPTransport, "request", fake_request)
+    monkeypatch.setattr(tiktokscraper_1.HTTPTransport, "request", fake_request)
     # Token acquisition is not under test here; prevent any external request.
     monkeypatch.setattr(tiktokscraper_1.TokenManager, "get_token", lambda self: "test-token")
     return call_order
