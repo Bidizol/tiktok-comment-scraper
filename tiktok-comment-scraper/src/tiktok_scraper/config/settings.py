@@ -7,7 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 
 class ConfigurationError(ValueError):
@@ -142,6 +142,23 @@ class Settings:
 
         data_dir = path_value("DATA_DIR", root / "data")
         proxy_url = merged.get("PROXY_URL") or None
+        if not proxy_url:
+            proxy_host = merged.get("PROXY_HOST", "").strip()
+            proxy_port = merged.get("PROXY_PORT", "").strip()
+            proxy_user = merged.get("PROXY_USER", "")
+            proxy_password = merged.get("PROXY_PASS", "")
+            if bool(proxy_host) != bool(proxy_port):
+                raise ConfigurationError("PROXY_HOST and PROXY_PORT must be configured together")
+            if proxy_host and proxy_port:
+                if bool(proxy_user) != bool(proxy_password):
+                    raise ConfigurationError("Both PROXY_USER and PROXY_PASS must be supplied together")
+                if ":" in proxy_host and not proxy_host.startswith("["):
+                    proxy_host = f"[{proxy_host}]"
+                credentials = (
+                    quote(proxy_user, safe="") + ":" + quote(proxy_password, safe="") + "@"
+                    if proxy_user else ""
+                )
+                proxy_url = f"http://{credentials}{proxy_host}:{proxy_port}"
         settings = cls(
             project_dir=root,
             data_dir=data_dir,
