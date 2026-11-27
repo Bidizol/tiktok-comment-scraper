@@ -69,7 +69,6 @@ def _validate_url(url: str):
 
 def _classify_exception(error: BaseException, proxy_enabled: bool):
     if isinstance(error, ssl.SSLError): return "TLS_ERROR", False
-    if isinstance(error, http.client.HTTPException): return ("PROXY_ERROR" if proxy_enabled else "NETWORK_ERROR"), True
     if isinstance(error, socket.gaierror): return "DNS_ERROR", True
     nested_reason = getattr(error, "reason", None)
     if isinstance(nested_reason, ssl.SSLError): return "TLS_ERROR", False
@@ -78,6 +77,7 @@ def _classify_exception(error: BaseException, proxy_enabled: bool):
         candidates = (getattr(error, "args", ()), getattr(nested_reason, "args", ()))
         if any(re.search(r"\b407\b", str(part)) for group in candidates for part in group):
             return "PROXY_AUTHENTICATION_ERROR", False
+    if isinstance(error, http.client.HTTPException): return "NETWORK_ERROR", True
     if isinstance(error, (socket.timeout, TimeoutError)): return ("PROXY_ERROR" if proxy_enabled else "TIMEOUT_ERROR"), True
     if isinstance(error, ConnectionError): return ("PROXY_ERROR" if proxy_enabled else "NETWORK_ERROR"), True
     if isinstance(error, urllib.error.URLError):
