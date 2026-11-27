@@ -1,746 +1,589 @@
-"""Cache safety module for the TikTok Comment Scraper.
+"""Versioned, portable JSON checkpoints with atomic replacement and preservation."""
+from __future__ import annotations
 
-Provides:
-- Thread-safe cache lock management with separate lock file
-- Cache validation and preservation (corrupted, old incomplete caches)
-- Disk space handling with configurable thresholds
-- Temporary file cleanup safeguards
-- Deterministic concurrency testing
-"""
-
+import hashlib
 import json
 import os
-import hashlib
-import fcntl
-from pathlib import Path
+import shutil
+import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Optional, Tuple, Dict, Any, List
+from pathlib import Path
+from typing import Any, Optional, Tuple
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # POSIX
+    msvcrt = None
+
+SCHEMA_VERSION = 2
+PLATFORM = "tiktok"
+DEFAULT_DISK_SPACE_THRESHOLD = 500 * 1024 * 1024
+_LOCKS_GUARD = threading.Lock()
+_THREAD_LOCKS: dict[int, threading.RLock] = {index: threading.RLock() for index in range(256)}
+_HELD_LOCKS = threading.local()
 
 
-# --------------------------------------------------------------------------- #
-# Lock management – stable separate lock file so that atomic rename does not  #
-# cause different processes to lock different inodes.                         #
-#                                                                             #
-# fcntl locks are bound to (process, inode). The file descriptor MUST remain  #
-# open for the lock to stay held, so acquired descriptors are kept in the     #
-# _ACTIVE_LOCK_FDS registry until release_cache_lock() closes them.           #
-# --------------------------------------------------------------------------- #
-
-LOCK_FILE = Path("cache") / ".cache_lock"
-
-_ACTIVE_LOCK_FDS: dict = {}
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def acquire_cache_lock(timeout: float = 30.0) -> bool:
-    """Acquire the cache lock using a separate lock file.
+def _canonical_json(value: dict) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
-    Uses fcntl.flock on the lock file for process-safe synchronization.
-    A stable lock file path ensures that atomic rename operations do not
-    cause different processes to lock different inodes.
 
-    The acquired file descriptor is retained in _ACTIVE_LOCK_FDS so the
-    lock stays held until release_cache_lock() is called.
+def _checksum(value: dict) -> str:
+    payload = dict(value)
+    payload.pop("integrity_sha256", None)
+    return hashlib.sha256(_canonical_json(payload)).hexdigest()
 
-    Returns True if the lock was acquired, False if it could not be acquired.
-    """
-    try:
-        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-    lock_fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_RDWR)
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _ACTIVE_LOCK_FDS[str(LOCK_FILE)] = lock_fd
-        return True
-    except (IOError, OSError):
-        # Another process holds the lock
+
+def _safe_video_id(video_id: str) -> str:
+    value = str(video_id)
+    if (not value or len(value) > 64
+            or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in value)):
+        raise ValueError("video_id must contain 1-64 safe filename characters")
+    return value
+
+
+def _canonical_path(cache_dir: Path, video_id: str) -> Path:
+    return cache_dir / f"tiktok_{_safe_video_id(video_id)}.json"
+
+
+def _legacy_path(cache_dir: Path, worker_id: int, video_id: str) -> Path:
+    return cache_dir / f"worker_{worker_id}_{_safe_video_id(video_id)}.json"
+
+
+def _resolve_checkpoint_path(cache_dir: Path, worker_id: int, video_id: str):
+    canonical = _canonical_path(cache_dir, video_id)
+    if canonical.exists():
+        return canonical, None
+    legacy_candidates = sorted(cache_dir.glob(f"worker_*_{_safe_video_id(video_id)}.json"))
+    if len(legacy_candidates) > 1:
+        return None, "multiple_legacy_checkpoints_for_video_require_manual_reconciliation"
+    if len(legacy_candidates) == 1:
+        return legacy_candidates[0], None
+    return _legacy_path(cache_dir, worker_id, video_id), None
+
+
+def _lock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".lock")
+
+
+def _thread_lock(path: Path) -> threading.Lock:
+    # Fixed lock striping avoids retaining one Python lock for every video
+    # ever processed during a long-running session.
+    key = str(path.resolve())
+    return _THREAD_LOCKS[hash(key) % len(_THREAD_LOCKS)]
+
+
+def _os_lock(fd: int, deadline: float) -> bool:
+    while True:
         try:
-            os.close(lock_fd)
-        except OSError:
-            pass
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            elif msvcrt is not None:
+                os.lseek(fd, 0, os.SEEK_SET)
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"0")
+                    os.fsync(fd)
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                raise RuntimeError("No supported cross-process file-lock backend")
+            return True
+        except (BlockingIOError, OSError):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
+def _os_unlock(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
+def acquire_path_lock(path: Path, timeout: float = 30.0) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _lock_path(path)
+    thread_lock = _thread_lock(lock_path)
+    if not thread_lock.acquire(timeout=max(0.0, timeout)):
         return False
+    fd = None
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        if not _os_lock(fd, time.monotonic() + max(0.0, timeout)):
+            os.close(fd)
+            thread_lock.release()
+            return False
+        held = getattr(_HELD_LOCKS, "stack", [])
+        held.append((str(path.resolve()), fd, thread_lock))
+        _HELD_LOCKS.stack = held
+        return True
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        thread_lock.release()
+        raise
 
 
-def release_cache_lock() -> None:
-    """Release the cache lock acquired by acquire_cache_lock()."""
-    lock_fd = _ACTIVE_LOCK_FDS.pop(str(LOCK_FILE), None)
-    if lock_fd is not None:
+def release_path_lock(path: Path) -> None:
+    key = str(path.resolve())
+    held = getattr(_HELD_LOCKS, "stack", [])
+    for index in range(len(held) - 1, -1, -1):
+        held_key, fd, thread_lock = held[index]
+        if held_key == key:
+            held.pop(index)
+            try:
+                _os_unlock(fd)
+            finally:
+                os.close(fd)
+                thread_lock.release()
+            return
+
+
+@contextmanager
+def video_checkpoint_lock(cache_dir: Path, video_id: str, timeout: float = 30.0):
+    lock_target = cache_dir / f".video_{_safe_video_id(video_id)}"
+    if not acquire_path_lock(lock_target, timeout):
+        raise TimeoutError("Another worker or process already owns this video's checkpoint")
+    try:
+        yield
+    finally:
+        release_path_lock(lock_target)
+
+
+def acquire_cache_lock(timeout: float = 30.0, cache_dir: Optional[Path] = None) -> bool:
+    root = Path(cache_dir) if cache_dir is not None else Path(__file__).resolve().parent / "cache"
+    target = root / ".cache-global"
+    key = str(target.resolve())
+    if any(held_key == key for held_key, _, _ in getattr(_HELD_LOCKS, "stack", [])):
+        return False
+    return acquire_path_lock(target, timeout)
+
+
+def release_cache_lock(cache_dir: Optional[Path] = None) -> None:
+    root = Path(cache_dir) if cache_dir is not None else Path(__file__).resolve().parent / "cache"
+    release_path_lock(root / ".cache-global")
+
+
+def _read_raw(path: Path) -> bytes:
+    return path.read_bytes()
+
+
+def _quarantine(path: Path, reason: str) -> Optional[Path]:
+    if not path.exists():
+        return None
+    quarantine_dir = path.parent / "quarantine"
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    target = quarantine_dir / f"{path.name}.{stamp}.corrupt"
+    try:
+        with path.open("rb") as source, target.open("xb") as destination:
+            shutil.copyfileobj(source, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.chmod(target, 0o600)
+        _fsync_directory(quarantine_dir)
+        path.unlink()
+        _fsync_directory(path.parent)
+        return target
+    except OSError:
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        except (OSError, IOError):
-            pass
-        try:
-            os.close(lock_fd)
+            target.unlink(missing_ok=True)
         except OSError:
             pass
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Cache validation – determine if a cache file is valid, corrupted, or stale
-# ---------------------------------------------------------------------------
-
-CORRUPTED_MARKER = "_CORRUPTED_"
-OLD_INCOMPLETE_DAYS = 7
-MIN_COMMENTS_TO_PRESERVE = 5
-
-
-def validate_cache(cache_data: dict, cache_filename: str) -> Tuple[str, str]:
-    """Validate cache data and return (status, reason).
-
-    Status values: 'valid', 'corrupted', 'old_incomplete', 'minimal'
-    """
-    # Check if file is marked as corrupted
-    if cache_data.get("_marked_corrupted") == True:
-        return "corrupted", "File marked as corrupted"
-
-    # Check if required fields exist
-    required_fields = ["video_id", "worker_id", "timestamp", "batch_number", "cursor", "total_comments", "comments"]
-    missing = [f for f in required_fields if f not in cache_data]
-    if missing:
-        return "corrupted", f"Missing required fields: {', '.join(missing)}"
-
-    # Try to verify JSON integrity by computing MD5
+def _fsync_directory(directory: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(str(directory), os.O_RDONLY)
     try:
-        cache_json = json.dumps(cache_data, sort_keys=True)
-        _ = hashlib.md5(cache_json.encode("utf-8")).hexdigest()
-    except (TypeError, ValueError):
-        return "corrupted", "Failed to compute hash for cache data"
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
-    # Check timestamp – if file is older than OLD_INCOMPLETE_DAYS and not complete
+
+def _validate_payload(data: Any, video_id: str, worker_id: int) -> Tuple[bool, str]:
+    if not isinstance(data, dict):
+        return False, "checkpoint_root_not_object"
+    if data.get("platform", PLATFORM) != PLATFORM or str(data.get("video_id", "")) != str(video_id):
+        return False, "checkpoint_identity_mismatch"
+    stored_worker_id = data.get("worker_id")
+    if stored_worker_id is not None and (
+            isinstance(stored_worker_id, bool) or not isinstance(stored_worker_id, int) or stored_worker_id < 0):
+        return False, "invalid_checkpoint_worker_provenance"
+    if not isinstance(data.get("comments"), list):
+        return False, "comments_not_list"
+    if not isinstance(data.get("seen_cids", []), list):
+        return False, "seen_cids_not_list"
+    cursor = data.get("cursor", 0)
+    batch = data.get("batch_number", 0)
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or not 0 <= cursor <= (2**63 - 1):
+        return False, "invalid_checkpoint_cursor"
+    if isinstance(batch, bool) or not isinstance(batch, int) or batch < 0:
+        return False, "invalid_checkpoint_batch_number"
+    total_comments = data.get("total_comments", len(data["comments"]))
+    if isinstance(total_comments, bool) or not isinstance(total_comments, int) or total_comments != len(data["comments"]):
+        return False, "checkpoint_comment_count_mismatch"
+    timestamp = data.get("timestamp_utc", data.get("timestamp"))
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        return False, "checkpoint_timestamp_missing"
     try:
-        ts_str = cache_data.get("timestamp", "")
-        if ts_str:
-            ts = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
-            now = datetime.now(timezone.utc)
-            age_days = (now - ts).total_seconds() / 86400.0
-            if age_days > OLD_INCOMPLETE_DAYS and not cache_data.get("is_complete", False):
-                return "old_incomplete", f"Cache older than {OLD_INCOMPLETE_DAYS} days and not complete"
-    except (ValueError, TypeError):
-        # Invalid timestamp – treat as corrupted but keep for analysis
-        pass
+        parsed_timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return False, "checkpoint_timestamp_invalid"
+    if parsed_timestamp.tzinfo is None and data.get("schema_version") == SCHEMA_VERSION:
+        return False, "checkpoint_timestamp_timezone_missing"
+    seen_ids = data.get("seen_cids", [])
+    if any(isinstance(cid, bool) or not isinstance(cid, (str, int)) or not str(cid).strip() for cid in seen_ids):
+        return False, "checkpoint_seen_id_invalid"
+    if not isinstance(data.get("is_complete", False), bool):
+        return False, "invalid_completion_flag"
+    if data.get("schema_version") == SCHEMA_VERSION:
+        expected = data.get("integrity_sha256")
+        if not isinstance(expected, str) or expected != _checksum(data):
+            return False, "checkpoint_integrity_checksum_mismatch"
+        if data.get("completion_state") not in {"IN_PROGRESS", "COMPLETE"}:
+            return False, "invalid_completion_state"
+        if data["is_complete"] != (data["completion_state"] == "COMPLETE"):
+            return False, "completion_state_flag_mismatch"
+    elif data.get("schema_version", data.get("version", "0")) not in (0, "0", 1, "1"):
+        return False, "unsupported_checkpoint_schema"
+    return True, "valid"
 
-    # Check if comments field has fewer than MIN_COMMENTS_TO_PRESERVE entries
-    comments = cache_data.get("comments", [])
-    if len(comments) > 0 and len(comments) < MIN_COMMENTS_TO_PRESERVE:
-        return "minimal", f"Cache contains only {len(comments)} comments (below {MIN_COMMENTS_TO_PRESERVE})"
 
-    return "valid", ""
+def validate_cache(cache_data: dict, cache_filename: str = "") -> Tuple[str, str]:
+    if not isinstance(cache_data, dict):
+        return "corrupted", "Checkpoint root must be an object"
+    ok, reason = _validate_payload(cache_data, str(cache_data.get("video_id", "")), cache_data.get("worker_id", 0))
+    return ("valid", "") if ok else ("corrupted", reason)
 
 
 def is_cache_corrupted(cache_data: dict) -> bool:
-    """Quick check if cache data is clearly corrupted."""
-    if cache_data is None:
-        return True
-    if not isinstance(cache_data, dict):
-        return True
-    # Check for essential keys
-    essential = {"video_id", "worker_id", "comments"}
-    if not essential.issubset(set(cache_data.keys())):
-        return True
-    return False
+    return validate_cache(cache_data)[0] == "corrupted"
 
 
-# ---------------------------------------------------------------------------
-# Safe cache save – writes to temp file then atomic rename, with lock
-# ---------------------------------------------------------------------------
-
-
-def save_cache_safe(
-    cache_dir: Path,
-    worker_id: int,
-    video_id: str,
-    comments: list,
-    seen_cids: set,
-    batch_number: int,
-    cursor: int,
-    is_final: bool = False,
-) -> Tuple[Optional[Path], Optional[str]]:
-    """Safely save cache data with locking and atomic write.
-
-    Writes to a temporary file first, then atomically renames to the final
-    path. The lock protects the complete read-modify-write operation.
-
-    Returns (final_path, error_message) – error_message is None on success.
-    """
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"worker_{worker_id}_{video_id}.json"
-
-    # Acquire lock before any read-modify-write
-    if not acquire_cache_lock():
-        return None, "Failed to acquire cache lock – another process is accessing the cache"
-
-    try:
-        # Validate existing cache before overwriting
-        existing_data = None
-        if cache_file.exists():
-            existing_data = _read_cache_file(cache_file)
-
-        # Build new cache data
-        new_data = _build_cache_data(
-            worker_id=worker_id,
-            video_id=video_id,
-            comments=comments,
-            seen_cids=seen_cids,
-            batch_number=batch_number,
-            cursor=cursor,
-            is_final=is_final,
-        )
-
-        # If existing cache is corrupted, preserve it by quarantining
-        if existing_data and is_cache_corrupted(existing_data):
-            quarantine_path = _quarantine_cache(cache_file, existing_data)
-            # We preserve the original data in quarantine, don't silently discard
-
-        # Write to temporary file first (in the same directory for atomic rename)
-        tmp_file = cache_dir / f".tmp_{cache_file.name}.{os.getpid()}"
-        try:
-            with open(tmp_file, "w", encoding="utf-8") as f:
-                json.dump(new_data, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-        except Exception as write_error:
-            # Clean up temp file
-            try:
-                tmp_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return None, f"Failed to write cache temp file: {write_error}"
-
-        # Atomic rename – this is safe because we hold the lock
-        try:
-            os.replace(tmp_file, cache_file)
-        except Exception as rename_error:
-            # Clean up temp file on failure
-            try:
-                tmp_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return None, f"Failed to atomic rename cache file: {rename_error}"
-
-        return cache_file, None
-
-    finally:
-        release_cache_lock()
-
-
-# ---------------------------------------------------------------------------
-# Quarantine – preserve original data before changing location
-# ---------------------------------------------------------------------------
-
-
-def _read_cache_file(cache_file: Path) -> Optional[dict]:
-    """Read and parse a cache file, returning None on failure."""
-    try:
-        with open(cache_file, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-        return None
-
-
-def _build_cache_data(
-    worker_id: int,
-    video_id: str,
-    comments: list,
-    seen_cids: set,
-    batch_number: int,
-    cursor: int,
-    is_final: bool = False,
-) -> dict:
-    """Build cache data dictionary."""
-    return {
-        "video_id": video_id,
+def _build_cache_data(worker_id: int, video_id: str, comments: list, seen_cids: set,
+                      batch_number: int, cursor: int, is_final: bool = False,
+                      completion_state: Optional[str] = None, stop_reason: Optional[str] = None,
+                      run_id: Optional[str] = None) -> dict:
+    if not isinstance(comments, list):
+        raise TypeError("comments must be a list; refusing to replace checkpoint")
+    if not isinstance(is_final, bool):
+        raise TypeError("is_final must be a boolean")
+    if isinstance(worker_id, bool) or not isinstance(worker_id, int) or worker_id < 0:
+        raise ValueError("worker_id must be a non-negative integer")
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or not 0 <= cursor <= (2**63 - 1):
+        raise ValueError("cursor must be a non-negative 64-bit integer")
+    if isinstance(batch_number, bool) or not isinstance(batch_number, int) or batch_number < 0:
+        raise ValueError("batch_number must be a non-negative integer")
+    ids = sorted({str(cid).strip() for cid in seen_cids if isinstance(cid, (str, int)) and not isinstance(cid, bool) and str(cid).strip()})
+    complete = is_final
+    state = completion_state or ("COMPLETE" if complete else "IN_PROGRESS")
+    if state not in {"IN_PROGRESS", "COMPLETE"}:
+        raise ValueError("completion_state must be IN_PROGRESS or COMPLETE")
+    if complete != (state == "COMPLETE"):
+        raise ValueError("is_final and completion_state must describe the same state")
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "platform": PLATFORM,
+        "video_id": _safe_video_id(video_id),
         "worker_id": worker_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "run_id": run_id,
+        "timestamp_utc": _utc_now(),
         "batch_number": batch_number,
+        "successful_pages": batch_number,
         "cursor": cursor,
         "total_comments": len(comments),
-        "is_complete": is_final,
-        "seen_cids": sorted(list(seen_cids)) if seen_cids else [],
+        "is_complete": complete,
+        "completion_state": state,
+        "stop_reason": stop_reason,
+        "seen_cids": ids,
         "comments": comments,
     }
+    payload["integrity_sha256"] = _checksum(payload)
+    return payload
 
 
-def _quarantine_cache(cache_file: Path, data: dict) -> Optional[Path]:
-    """Move corrupted cache to quarantine directory, preserving original data.
-
-    Returns the quarantine path, or None if quarantine could not be created.
-    The original data is preserved intact; the copy is verified before
-    changing its location.
-    """
-    quarantine_dir = cache_file.parent / ".quarantine"
-    quarantine_dir.mkdir(parents=True, exist_ok=True)
-
-    # Verify data can be serialized before moving
+def _disk_space_error(directory: Path) -> Optional[str]:
     try:
-        json.dumps(data)
-    except (TypeError, ValueError):
-        # Can't serialize – can't quarantine reliably
-        return None
-
-    quarantine_path = quarantine_dir / cache_file.name
-
+        free = shutil.disk_usage(directory).free
+    except OSError as exc:
+        return f"Could not inspect checkpoint storage capacity: {type(exc).__name__}"
+    threshold_raw = os.environ.get("DISK_SPACE_THRESHOLD_BYTES")
     try:
-        # Write the verified copy to quarantine
-        with open(quarantine_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        # Verify the copy by reading it back
-        if not _verify_quarantine_copy(quarantine_path, data):
-            # Copy verification failed – remove the quarantine file
-            quarantine_path.unlink(missing_ok=True)
-            return None
-        # Remove original cache file
-        cache_file.unlink(missing_ok=True)
-        return quarantine_path
-    except OSError:
-        # Quarantine failed – leave original in place
-        return None
+        threshold = int(threshold_raw) if threshold_raw is not None else DEFAULT_DISK_SPACE_THRESHOLD
+    except ValueError:
+        return "DISK_SPACE_THRESHOLD_BYTES must be an integer"
+    if threshold < 0:
+        return "DISK_SPACE_THRESHOLD_BYTES cannot be negative"
+    if free < threshold:
+        return f"Insufficient free space for checkpoint write ({free} bytes available; {threshold} required)"
+    return None
 
 
-def _verify_quarantine_copy(quarantine_path: Path, original_data: dict) -> bool:
-    """Verify that the quarantine copy matches the original data."""
+def _atomic_write(path: Path, data: dict) -> None:
+    encoded = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    temp_path = Path(temp_name)
     try:
-        with open(quarantine_path, "r", encoding="utf-8") as f:
-            quarantined_data = json.load(f)
-        # Compare key fields
-        return (
-            quarantined_data.get("video_id") == original_data.get("video_id")
-            and quarantined_data.get("worker_id") == original_data.get("worker_id")
-            and quarantined_data.get("timestamp") == original_data.get("timestamp")
-            and quarantined_data.get("total_comments") == original_data.get("total_comments")
-        )
-    except (json.JSONDecodeError, OSError):
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Atomic read-modify-write cache save under a single lock hold
-# ---------------------------------------------------------------------------
-
-
-def save_and_load_cache_safe(
-    cache_dir: Path,
-    worker_id: int,
-    video_id: str,
-    comments: list,
-    seen_cids: set,
-    batch_number: int,
-    cursor: int,
-    is_final: bool = False,
-) -> Tuple[Optional[Path], Optional[str]]:
-    """Atomically read-modify-write cache data under a single lock hold.
-
-    Acquires the cache lock ONCE and holds it across the complete
-    read-modify-write transaction:
-
-        1. LOAD existing cache (if any)
-        2. Validate existing cache (quarantine corrupt data, preserve it)
-        3. BUILD new cache data from the accumulated in-memory state
-        4. WRITE to a temp file in the same directory (fsync)
-        5. Atomically rename temp -> final cache file
-        6. RELEASE the lock
-
-    Because the lock is held for the entire transaction, no other
-    process/thread can interleave a read or write between the load and the
-    save, eliminating the lost-update race that exists when load and save
-    are separate locked operations.
-
-    The cache data shape is identical to that produced by _build_cache_data,
-    so existing caches remain backward-compatible.
-
-    Returns (final_path, error_message) – error_message is None on success.
-    """
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"worker_{worker_id}_{video_id}.json"
-
-    # Acquire lock before the complete read-modify-write transaction.
-    if not acquire_cache_lock():
-        return None, "Failed to acquire cache lock – another process is accessing the cache"
-
-    try:
-        # 1. LOAD existing cache before overwriting
-        existing_data = None
-        if cache_file.exists():
-            existing_data = _read_cache_file(cache_file)
-
-        # 2. If existing cache is corrupted, preserve it by quarantining.
-        #    We do not silently discard previously collected comments.
-        if existing_data and is_cache_corrupted(existing_data):
-            _quarantine_cache(cache_file, existing_data)
-            existing_data = None  # start from a clean slate; old data is in quarantine
-
-        # 3. Build new cache data from current in-memory state
-        new_data = _build_cache_data(
-            worker_id=worker_id,
-            video_id=video_id,
-            comments=comments,
-            seen_cids=seen_cids,
-            batch_number=batch_number,
-            cursor=cursor,
-            is_final=is_final,
-        )
-
-        # 4. Write to temporary file first (same directory for atomic rename)
-        tmp_file = cache_dir / f".tmp_{cache_file.name}.{os.getpid()}"
+        os.fchmod(fd, 0o600) if hasattr(os, "fchmod") else None
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
         try:
-            with open(tmp_file, "w", encoding="utf-8") as f:
-                json.dump(new_data, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-        except Exception as write_error:
-            try:
-                tmp_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return None, f"Failed to write cache temp file: {write_error}"
-
-        # 5. Atomic rename – safe because we hold the lock
-        try:
-            os.replace(tmp_file, cache_file)
-        except Exception as rename_error:
-            try:
-                tmp_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return None, f"Failed to atomic rename cache file: {rename_error}"
-
-        return cache_file, None
-
-    finally:
-        # 6. Release the lock exactly once, always.
-        release_cache_lock()
-
-
-# ---------------------------------------------------------------------------
-# Safe cache load – with validation and corruption handling
-# ---------------------------------------------------------------------------
-
-
-def load_cache_safe(
-    cache_dir: Path,
-    worker_id: int,
-    video_id: str,
-) -> Tuple[Optional[dict], str]:
-    """Safely load cache data with validation.
-
-    Returns (data, status_message).
-    - If cache is valid: data is the cache dict, status is 'valid'
-    - If cache is corrupted: data may be returned with warning, status reports issue
-    - If cache doesn't exist: data is None, status reports missing
-    """
-    cache_file = cache_dir / f"worker_{worker_id}_{video_id}.json"
-
-    if not cache_file.exists():
-        return None, "Cache file does not exist"
-
-    # Acquire lock for read operation
-    if not acquire_cache_lock():
-        return None, "Failed to acquire cache lock – another process is accessing the cache"
-
-    try:
-        data = _read_cache_file(cache_file)
-
-        if data is None:
-            return None, "Failed to parse cache file (corrupted JSON)"
-
-        # Cache filenames are not proof of identity. Reject and quarantine
-        # payloads whose embedded video/worker identity does not match the
-        # requested cache key.
-        if data.get("video_id") != str(video_id) or data.get("worker_id") != worker_id:
-            reason = "Cache identity does not match requested video_id/worker_id"
-            quarantine_path = _quarantine_cache(cache_file, data)
-            if quarantine_path:
-                return {
-                    "_quarantined": True,
-                    "_quarantine_path": str(quarantine_path),
-                    "_original_filename": cache_file.name,
-                    "_corruption_reason": reason,
-                }, f"Cache identity mismatch; quarantined: {reason}"
-            return data, f"Cache identity mismatch; quarantine failed: {reason}"
-
-        # Validate the cache
-        status, reason = validate_cache(data, cache_file.name)
-
-        if status == "corrupted":
-            # Preserve corrupted cache – don't silently discard
-            # Move to quarantine and return a special marker
-            quarantine_path = _quarantine_cache(cache_file, data)
-            if quarantine_path:
-                return {
-                    "_quarantined": True,
-                    "_quarantine_path": str(quarantine_path),
-                    "_original_filename": cache_file.name,
-                    "_corruption_reason": reason,
-                }, f"Cache corrupted and quarantined: {reason} (filename: {cache_file.name})"
-            # If quarantine failed, still return the data with warning
-            return data, f"Cache corrupted: {reason} (could not quarantine: filename: {cache_file.name})"
-
-        if status == "old_incomplete":
-            return data, f"Old incomplete cache: {reason} (filename: {cache_file.name})"
-
-        if status == "minimal":
-            # Preserve minimal caches – don't delete
-            return data, f"Minimal cache preserved: {reason} (filename: {cache_file.name})"
-
-        # Valid cache
-        return data, "valid"
-
-    finally:
-        release_cache_lock()
-
-
-# ---------------------------------------------------------------------------
-# Disk space handling
-# ---------------------------------------------------------------------------
-
-# Default disk space threshold in bytes (configurable via environment)
-# Default: 500 MB free required
-DEFAULT_DISK_SPACE_THRESHOLD = 500 * 1024 * 1024  # 500 MB
-
-
-def get_disk_space_threshold() -> int:
-    """Get the configurable disk space threshold in bytes.
-
-    Can be overridden via environment variable DISK_SPACE_THRESHOLD_BYTES.
-    """
-    env_val = os.environ.get("DISK_SPACE_THRESHOLD_BYTES")
-    if env_val:
-        try:
-            return int(env_val)
-        except ValueError:
-            pass
-    return DEFAULT_DISK_SPACE_THRESHOLD
-
-
-def check_disk_space(min_free_bytes: int) -> Tuple[bool, str]:
-    """Check if enough disk space is available.
-
-    Returns (has_enough_space, diagnostic_message).
-    """
-    try:
-        stat = os.statvfs(".")
-        free_bytes = stat.f_bavail * stat.f_frsize
-        threshold = get_disk_space_threshold()
-
-        if free_bytes < min_free_bytes:
-            return False, (
-                f"Insufficient disk space: {free_bytes / 1024 / 1024:.1f} MB free, "
-                f"required: {min_free_bytes / 1024 / 1024:.1f} MB (threshold: "
-                f"{threshold / 1024 / 1024:.1f} MB). "
-                f"Cache write aborted to protect previous data."
-            )
-
-        return True, "Sufficient disk space available"
-    except OSError as error:
-        return False, f"Could not check disk space: {error}"
-
-
-# ---------------------------------------------------------------------------
-# Temporary file cleanup – only remove demonstrably orphaned temp files
-# ---------------------------------------------------------------------------
-
-
-def cleanup_orphan_temp_files(cache_dir: Path) -> List[str]:
-    """Remove temporary files that are demonstrably orphaned.
-
-    Ownership is established by attempting a non-blocking fcntl lock on the
-    temporary file itself:
-
-      * If the lock CANNOT be acquired, another live process holds the file
-        open/locked -> it belongs to an active worker -> PRESERVE it.
-      * If the lock CAN be acquired, no live process holds it -> it is truly
-        orphaned -> remove it and release the lock.
-
-    This never deletes an active worker's temporary file, works across
-    separate processes (fcntl locks are kernel-enforced), and does not rely
-    on any unsynchronized in-memory active_workers set.
-
-    Returns list of filenames that were removed.
-    """
-    import fcntl as _fcntl
-
-    removed = []
-    if not cache_dir.exists():
-        return removed
-
-    for tmp_file in cache_dir.glob(".tmp_*.json"):
-        lock_fd = None
-        try:
-            # Non-blocking exclusive lock on the temp file itself.
-            lock_fd = os.open(str(tmp_file), os.O_CREAT | os.O_RDWR)
-            try:
-                _fcntl.flock(lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-            except (OSError, IOError):
-                # Another live process holds this temp file – active worker.
-                # Preserve it: never delete an active worker's temporary file.
-                continue
-            # We hold the lock => no live process owns this temp file => orphan.
-            tmp_file.unlink()
-            removed.append(tmp_file.name)
+            os.chmod(path, 0o600)
         except OSError:
-            # File disappeared or is otherwise inaccessible; leave it alone.
             pass
-        finally:
-            if lock_fd is not None:
-                try:
-                    _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
-                    os.close(lock_fd)
-                except (OSError, IOError):
-                    pass
+        _fsync_directory(path.parent)
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
+
+def _preserve_previous(path: Path) -> Optional[Path]:
+    """Keep one durable immediately-previous checkpoint without unbounded growth."""
+    if not path.exists():
+        return None
+    previous = path.with_name(path.name + ".previous.json")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{previous.name}.", suffix=".tmp", dir=str(path.parent))
+    temporary = Path(temporary_name)
+    try:
+        with path.open("rb") as source, os.fdopen(descriptor, "wb") as destination:
+            shutil.copyfileobj(source, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        os.replace(temporary, previous)
+        _fsync_directory(path.parent)
+        return previous
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _load_unlocked(path: Path, worker_id: int, video_id: str):
+    if not path.exists():
+        return None, "checkpoint_missing"
+    try:
+        raw = _read_raw(path)
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        preserved = _quarantine(path, f"unreadable:{type(exc).__name__}")
+        if preserved:
+            return {"_quarantined": True, "_quarantine_path": str(preserved)}, "checkpoint_unreadable_quarantined"
+        return None, "checkpoint_unreadable_and_preservation_failed"
+    ok, reason = _validate_payload(data, video_id, worker_id)
+    if not ok:
+        preserved = _quarantine(path, reason)
+        if preserved:
+            return {"_quarantined": True, "_quarantine_path": str(preserved), "_corruption_reason": reason}, f"{reason}_quarantined"
+        return None, f"{reason}_preservation_failed"
+    # Migrate legacy cache metadata in memory; disk is updated on the next checkpoint.
+    if data.get("schema_version") != SCHEMA_VERSION:
+        data = dict(data)
+        data["schema_version"] = 1
+        data["platform"] = PLATFORM
+        data["timestamp_utc"] = data.get("timestamp") or _utc_now()
+        data["successful_pages"] = data.get("batch_number", 0)
+        data["completion_state"] = "COMPLETE" if data.get("is_complete") else "IN_PROGRESS"
+        data["stop_reason"] = None
+    return data, "valid" if data.get("schema_version") == SCHEMA_VERSION else "legacy_cache_migrated_in_memory"
+
+
+def load_cache_safe(cache_dir: Path, worker_id: int, video_id: str):
+    cache_dir = Path(cache_dir)
+    path, resolution_error = _resolve_checkpoint_path(cache_dir, worker_id, video_id)
+    if resolution_error:
+        return None, resolution_error
+    if not acquire_cache_lock(timeout=30.0):
+        return None, "global_cache_lock_timeout"
+    try:
+        if not acquire_path_lock(path, timeout=30.0):
+            return None, "checkpoint_lock_timeout"
+        try:
+            return _load_unlocked(path, worker_id, str(video_id))
+        finally:
+            release_path_lock(path)
+    finally:
+        release_cache_lock()
+
+
+def save_and_load_cache_safe(cache_dir: Path, worker_id: int, video_id: str, comments: list,
+                             seen_cids: set, batch_number: int, cursor: int,
+                             is_final: bool = False, completion_state: Optional[str] = None,
+                             stop_reason: Optional[str] = None, run_id: Optional[str] = None):
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = _canonical_path(cache_dir, video_id)
+    # The global lock preserves the legacy lock contract; the per-video lock
+    # additionally prevents concurrent writes to this video's checkpoint.
+    if not acquire_cache_lock(timeout=5.0):
+        return None, "Global cache lock is already held by another writer"
+    try:
+        if not acquire_path_lock(path, timeout=0.05):
+            return None, "Per-video checkpoint lock is already held by another writer"
+        try:
+            space_error = _disk_space_error(cache_dir)
+            if space_error:
+                return None, space_error
+            existing = None
+            source_path, resolution_error = _resolve_checkpoint_path(cache_dir, worker_id, video_id)
+            if resolution_error:
+                return None, resolution_error
+            if source_path.exists():
+                existing, status = _load_unlocked(source_path, worker_id, str(video_id))
+                if existing is None:
+                    return None, status
+                if existing.get("_quarantined"):
+                    # The damaged bytes are preserved in quarantine. The
+                    # caller may only continue from its current in-memory data.
+                    existing = None
+                elif existing.get("is_complete"):
+                    return None, "Refusing to overwrite an already completed video checkpoint"
+                else:
+                    previous_batch = int(existing.get("batch_number", 0))
+                    previous_cursor = int(existing.get("cursor", 0))
+                    if batch_number < previous_batch:
+                        return None, "Refusing checkpoint regression: batch number moved backwards"
+                    if cursor < previous_cursor:
+                        return None, "Refusing checkpoint regression: cursor moved backwards"
+                    if batch_number == previous_batch and comments != existing.get("comments", []):
+                        return None, "Checkpoint lock conflict: divergent data at the same batch position"
+                    if len(comments) < len(existing.get("comments", [])):
+                        return None, "Refusing checkpoint regression: collected comment count decreased"
+            new_data = _build_cache_data(worker_id, str(video_id), comments, seen_cids,
+                                         batch_number, cursor, is_final, completion_state,
+                                         stop_reason, run_id)
+            if existing is not None:
+                try:
+                    _preserve_previous(source_path)
+                except OSError as exc:
+                    return None, f"Could not preserve previous checkpoint: {type(exc).__name__}"
+            try:
+                _atomic_write(path, new_data)
+            except (OSError, TypeError, ValueError) as exc:
+                return None, f"Checkpoint write failed: {type(exc).__name__}: {exc}"
+            return path, None
+        finally:
+            release_path_lock(path)
+    finally:
+        release_cache_lock()
+
+
+def save_cache_safe(cache_dir: Path, worker_id: int, video_id: str, comments: list,
+                    seen_cids: set, batch_number: int, cursor: int, is_final: bool = False):
+    return save_and_load_cache_safe(cache_dir, worker_id, video_id, comments, seen_cids,
+                                    batch_number, cursor, is_final)
+
+
+def restore_previous_checkpoint(cache_dir: Path, video_id: str, worker_id: int = 0):
+    """Restore the immediately previous valid checkpoint, preserving current data."""
+    cache_dir = Path(cache_dir)
+    current = _canonical_path(cache_dir, video_id)
+    previous = current.with_name(current.name + ".previous.json")
+    if not acquire_path_lock(current):
+        return None, "checkpoint_lock_timeout"
+    try:
+        if not previous.exists():
+            return None, "previous_checkpoint_missing"
+        try:
+            data = json.loads(previous.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return None, f"previous_checkpoint_unreadable:{type(exc).__name__}"
+        backup_worker_id = data.get("worker_id", worker_id) if isinstance(data, dict) else worker_id
+        valid, reason = _validate_payload(data, str(video_id), backup_worker_id)
+        if not valid:
+            return None, f"previous_checkpoint_invalid:{reason}"
+        if current.exists():
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+            archive = current.with_name(f"{current.name}.pre_restore.{stamp}")
+            try:
+                with current.open("rb") as source, archive.open("xb") as destination:
+                    shutil.copyfileobj(source, destination)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                os.chmod(archive, 0o600)
+                _fsync_directory(current.parent)
+            except OSError as exc:
+                return None, f"current_checkpoint_archive_failed:{type(exc).__name__}"
+        try:
+            _atomic_write(current, data)
+        except (OSError, TypeError, ValueError) as exc:
+            return None, f"checkpoint_restore_failed:{type(exc).__name__}"
+        return current, None
+    finally:
+        release_path_lock(current)
+
+
+def cleanup_orphan_temp_files(cache_dir: Path):
+    """Remove legacy temp files only when their own OS lock is available."""
+    removed = []
+    root = Path(cache_dir)
+    if not root.exists():
+        return removed
+    # Older POSIX releases used this filename pattern and held an OS lock
+    # while writing. Windows does not permit unlinking an open locked file.
+    for candidate in (root.glob(".tmp_*.json") if os.name != "nt" else ()):
+        descriptor = None
+        acquired = False
+        try:
+            descriptor = os.open(str(candidate), os.O_CREAT | os.O_RDWR, 0o600)
+            acquired = _os_lock(descriptor, time.monotonic())
+            if acquired:
+                candidate.unlink()
+                removed.append(candidate.name)
+        except OSError:
+            continue
+        finally:
+            if descriptor is not None:
+                try:
+                    if acquired:
+                        _os_unlock(descriptor)
+                finally:
+                    os.close(descriptor)
+    # New-format temporary files are uniquely named. Only old files are
+    # eligible for cleanup; active writers never leave a seven-day temp.
+    cutoff = time.time() - 7 * 24 * 60 * 60
+    for candidate in root.glob(".*.tmp"):
+        try:
+            if candidate.stat().st_mtime < cutoff:
+                candidate.unlink()
+                removed.append(candidate.name)
+        except OSError:
+            continue
     return removed
 
 
-# ---------------------------------------------------------------------------
-# Deterministic mocked concurrency test support
-# ---------------------------------------------------------------------------
-
-
-class ConcurrencyTestResult:
-    """Result of a deterministic concurrency test."""
-
-    def __init__(self):
-        self.overwrite_lost = False
-        self.both_writers_succeeded = False
-        self.final_comment_count = 0
-        self.test_passed = False
-
-    def to_dict(self) -> dict:
-        return {
-            "overwrite_lost": self.overwrite_lost,
-            "both_writers_succeeded": self.both_writers_succeeded,
-            "final_comment_count": self.final_comment_count,
-            "test_passed": self.test_passed,
-        }
-
-
-def run_concurrency_test(
-    cache_dir: Path,
-    worker_a_comments: list,
-    worker_b_comments: list,
-    mock_current_time: Optional[datetime] = None,
-) -> ConcurrencyTestResult:
-    """Run a deterministic mocked concurrency test.
-
-    Two workers attempt to write to the same cache file concurrently.
-    The test verifies that the lock mechanism prevents one worker from
-    overwriting the other's collected comments.
-
-    Args:
-        cache_dir: Directory for cache files
-        worker_a_comments: Comments that worker A intends to save
-        worker_b_comments: Comments that worker B intends to save
-        mock_current_time: Optional fixed time for deterministic testing
-
-    Returns:
-        ConcurrencyTestResult with test outcome
-    """
-    result = ConcurrencyTestResult()
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # Use a shared cache file for both workers
-    shared_cache = cache_dir / "concurrent_test.json"
-
-    # Phase 1: Write without lock (Worker A) – simulate old behavior
-    # Phase 2: Write without lock (Worker B) – this would overwrite A
-    # Phase 3: Write with lock (the safe approach)
-
-    # Acquire lock, then write
-    if acquire_cache_lock():
-        try:
-            # Write combined data (simulating proper synchronized access)
-            combined_comments = worker_a_comments + worker_b_comments
-            data_combined = {
-                "video_id": "test_concurrent",
-                "worker_id": 0,  # Coordinator
-                "timestamp": (mock_current_time or datetime.now(timezone.utc)).isoformat(),
-                "batch_number": 1,
-                "cursor": 0,
-                "total_comments": len(combined_comments),
-                "is_complete": False,
-                "seen_cids": [],
-                "comments": combined_comments,
-            }
-
-            # Write to temp file then atomic rename
-            tmp_file = cache_dir / f".tmp_concurrent_test.json.{os.getpid()}"
-            with open(tmp_file, "w", encoding="utf-8") as f:
-                json.dump(data_combined, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_file, shared_cache)
-        finally:
-            release_cache_lock()
-    else:
-        result.overwrite_lost = True
-        result.test_passed = False
-        return result
-
-    # Read back what was written
+def check_disk_space(min_free_bytes: int):
     try:
-        with open(shared_cache, "r", encoding="utf-8") as f:
-            written_data = json.load(f)
-        result.final_comment_count = written_data.get("total_comments", 0)
-        result.both_writers_succeeded = True
-    except Exception:
-        result.final_comment_count = 0
-        result.both_writers_succeeded = False
-
-    # Test passes if combined comments are preserved (lock protection works)
-    expected_total = len(worker_a_comments) + len(worker_b_comments)
-    result.overwrite_lost = result.final_comment_count != expected_total
-    result.test_passed = not result.overwrite_lost and result.both_writers_succeeded
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Disk-full write failure test support
-# ---------------------------------------------------------------------------
-
-
-def simulate_disk_full_write(
-    cache_dir: Path,
-    worker_id: int,
-    video_id: str,
-    comments: list,
-    seen_cids: set,
-    batch_number: int,
-    cursor: int,
-) -> Tuple[bool, str]:
-    """Simulate a write when disk is full.
-
-    Temporarily sets threshold to 0 to force disk-full condition,
-    attempts save, then restores threshold.
-
-    Returns (success, error_message).
-    """
-    # Save original threshold
-    original_threshold_val = os.environ.pop("DISK_SPACE_THRESHOLD_BYTES", None)
-
-    try:
-        # Force disk full by setting threshold to 0
-        os.environ["DISK_SPACE_THRESHOLD_BYTES"] = "0"
-
-        # Try to save cache – should fail with diagnostic
-        success, error = save_cache_safe(
-            cache_dir=cache_dir,
-            worker_id=worker_id,
-            video_id=video_id,
-            comments=comments,
-            seen_cids=seen_cids,
-            batch_number=batch_number,
-            cursor=cursor,
-            is_final=False,
-        )
-
-        if success is None or error is not None:
-            # Write failed – this is the expected behavior when disk is full
-            return False, error or "Write failed due to insufficient disk space"
-        return True, None
-
-    finally:
-        # Restore original threshold
-        if original_threshold_val is not None:
-            os.environ["DISK_SPACE_THRESHOLD_BYTES"] = original_threshold_val
-        else:
-            os.environ.pop("DISK_SPACE_THRESHOLD_BYTES", None)
+        free = shutil.disk_usage(Path.cwd()).free
+    except OSError as exc:
+        return False, f"Could not inspect disk space: {type(exc).__name__}"
+    return (free >= min_free_bytes, f"{free} bytes free; {min_free_bytes} required")

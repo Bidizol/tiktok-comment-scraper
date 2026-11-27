@@ -5,7 +5,6 @@ import threading
 import uuid
 import json
 import time
-import fcntl
 import shutil
 from pathlib import Path
 from datetime import datetime, timezone
@@ -42,7 +41,10 @@ from pagination_state import normalise_has_more, PaginationState, PaginationMeta
 # Cache safety – single shared read-modify-write implementation.
 # Imported from cache_safety so there is no second competing cache implementation.
 sys.path.insert(0, str(Path(__file__).parent))
-from cache_safety import save_and_load_cache_safe, cleanup_orphan_temp_files, load_cache_safe  # noqa: E402
+from cache_safety import (
+    save_and_load_cache_safe, cleanup_orphan_temp_files, load_cache_safe,
+    video_checkpoint_lock,
+)  # noqa: E402
 
 # Configuration
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -51,7 +53,7 @@ MAX_COMMENTS = 10000
 COMMENTS_PER_BATCH = 50
 
 # Cache version for backward compatibility
-CACHE_VERSION = "0"
+CACHE_VERSION = "2"
 
 # Save cache every N batches (operational batch persistence interval)
 # Phase 5 Block 3.1: checkpoint every successfully processed batch to minimize
@@ -84,105 +86,43 @@ TEST_VIDEOS = [
 ]
 
 def validate_cache_data(cached: dict, video_id: str) -> tuple:
-    """Validate and sanitize cached data for backward compatibility.
+    """Validate without silently dropping any previously collected records.
 
-    Returns (validated_comments, validated_seen_cids, validated_cursor, validated_batch_number, is_valid)
-    If cache is invalid, returns ([], set(), 0, 0, False)
+    Returns (comments, seen_cids, cursor, batch_number, is_complete, is_valid).
+    Invalid structures are rejected as a whole and remain available in quarantine.
     """
-    if not isinstance(cached, dict):
-        return [], set(), 0, 0, False
-
-    # Validate video_id
-    if cached.get("video_id") != video_id:
-        return [], set(), 0, 0, False
-
-    # Validate version compatibility (backward compatible: "0" or "1")
-    cached_version = cached.get("version", "0")
-    if cached_version not in ("0", "1"):
-        # Legacy cache without version field - still accept but mark
-        cached_version = "0"
-
-    # Validate comments is a list
-    comments = cached.get("comments", [])
-    if not isinstance(comments, list):
-        comments = []
-
-    # Validate seen_cids is a list
-    seen_cids_raw = cached.get("seen_cids", [])
-    if not isinstance(seen_cids_raw, list):
-        seen_cids_raw = []
-
-    # Convert seen_cids to set, validating each CID
-    seen_cids = set()
-    for cid in seen_cids_raw:
-        if isinstance(cid, str) and cid.strip():
-            seen_cids.add(cid)
-
-    # Validate cursor
-    cursor = cached.get("cursor", 0)
-    try:
-        cursor = int(cursor)
-    except (ValueError, TypeError):
-        cursor = 0
-
-    # Validate batch_number
-    batch_number = cached.get("batch_number", 0)
-    try:
-        batch_number = int(batch_number)
-    except (ValueError, TypeError):
-        batch_number = 0
-
-    # Validate total_comments consistency
-    total_comments = cached.get("total_comments", len(comments))
-    try:
-        total_comments = int(total_comments)
-    except (ValueError, TypeError):
-        total_comments = len(comments)
-
-    # Trim comments to match total_comments if there's discrepancy
-    if total_comments < len(comments):
-        comments = comments[:total_comments]
-
-    # Validate completion state: is_complete should only be True if we have
-    # comments and the data is consistent
+    if not isinstance(cached, dict) or str(cached.get("video_id", "")) != str(video_id):
+        return [], set(), 0, 0, False, False
+    comments = cached.get("comments")
+    seen_raw = cached.get("seen_cids")
+    cursor = cached.get("cursor")
+    batch_number = cached.get("batch_number")
+    total = cached.get("total_comments", len(comments) if isinstance(comments, list) else None)
     is_complete = cached.get("is_complete", False)
-    if is_complete and not comments:
-        # Cache marked complete but has no comments - this is inconsistent
-        # Don't mark as complete, but try to recover what we can
-        is_complete = False
-
-    # Validate that if is_complete is True, we have reasonable data
-    if is_complete and total_comments > 0 and len(comments) == 0:
-        is_complete = False
-
-    # Validate comment IDs within comments
-    valid_comments = []
-    for comment in comments:
-        if not isinstance(comment, dict):
-            continue
-        cid = comment.get("cid")
-        if cid is not None and isinstance(cid, str) and cid.strip():
-            # Ensure comment has essential fields
-            if "text" in comment or "unique_id" in comment:
-                valid_comments.append(comment)
-        else:
-            # Comment without valid CID - still include but track it
-            if "text" in comment:
-                valid_comments.append(comment)
-
-    # Update total_comments to match valid comments
-    total_comments = len(valid_comments)
-
-    return valid_comments, seen_cids, cursor, batch_number, is_complete
+    if not isinstance(comments, list) or not isinstance(seen_raw, list):
+        return [], set(), 0, 0, False, False
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or not 0 <= cursor <= (2**63 - 1):
+        return [], set(), 0, 0, False, False
+    if isinstance(batch_number, bool) or not isinstance(batch_number, int) or batch_number < 0:
+        return [], set(), 0, 0, False, False
+    if isinstance(total, bool) or not isinstance(total, int) or total != len(comments):
+        return [], set(), 0, 0, False, False
+    if not isinstance(is_complete, bool):
+        return [], set(), 0, 0, False, False
+    seen_cids = set()
+    for cid in seen_raw:
+        if isinstance(cid, bool) or not isinstance(cid, (str, int)) or not str(cid).strip():
+            return [], set(), 0, 0, False, False
+        seen_cids.add(str(cid).strip())
+    return list(comments), seen_cids, cursor, batch_number, is_complete, True
 
 
 def validate_cache_identity(cached: dict, video_id: str, worker_id: int) -> bool:
     """Validate that a loaded cache matches the requested identity and data structures.
 
-    Phase 5 Block 3.1: Every cache loaded for a scraping operation must have:
-      - The exact requested video_id
-      - The exact requested worker_id
-      - Valid expected data structures for comments, seen_cids, cursor and batch_number.
+    Every cache loaded for a scraping operation must match the TikTok platform
+    and requested video_id. Worker ID is provenance, not part of the identity.
+    Comment, seen-ID, cursor and batch structures are validated without dropping records.
 
     Returns True if the cache is valid and safe to resume from.
     Returns False if the cache is missing fields, has mismatched identity, or
@@ -196,8 +136,11 @@ def validate_cache_identity(cached: dict, video_id: str, worker_id: int) -> bool
     if cached.get("video_id") != video_id:
         return False
 
-    # Exact worker_id match required
-    if cached.get("worker_id") != worker_id:
+    # New checkpoints use (platform, video_id) as identity. Legacy
+    # worker-keyed files retain their historical worker ownership during migration.
+    if cached.get("platform") == "tiktok":
+        pass
+    elif cached.get("worker_id") != worker_id:
         return False
 
     # comments must be a list
@@ -247,8 +190,9 @@ def load_cache(worker_id: int, video_id: str) -> dict | None:
     If an existing cache cannot be safely migrated, preserve it and report
     the problem rather than silently overwriting it.
     """
-    cache_file = CACHE_DIR / f"worker_{worker_id}_{video_id}.json"
-    if not cache_file.exists():
+    cache_file = CACHE_DIR / f"tiktok_{video_id}.json"
+    legacy_cache_files = list(CACHE_DIR.glob(f"worker_*_{video_id}.json"))
+    if not cache_file.exists() and not legacy_cache_files:
         return None
 
     cached, cache_status = load_cache_safe(CACHE_DIR, worker_id, video_id)
@@ -266,101 +210,70 @@ def load_cache(worker_id: int, video_id: str) -> dict | None:
         return None
 
     # Validate the cached data
-    comments, seen_cids, cursor, batch_number, is_complete = validate_cache_data(cached, video_id)
+    comments, seen_cids, cursor, batch_number, is_complete, data_valid = validate_cache_data(cached, video_id)
+    if not data_valid:
+        safe_print(f"[W{worker_id}] Cache structure rejected and preserved: {cache_file}")
+        return None
 
     if not comments and not cached.get("video_id"):
         # No valid data to recover
         return None
 
-    # Report if version was incompatible or data was sanitized
-    cached_version = cached.get("version", "0")
-    if cached_version not in ("0", "1"):
-        safe_print(f"[W{worker_id}] Versión de cache no compatible: {cached_version}, datos sanitizados")
-
-    # Check if data was significantly modified during sanitization
-    original_comment_count = len(cached.get("comments", []))
-    if original_comment_count != len(comments):
-        safe_print(f"[W{worker_id}] Cache sanitizado: {original_comment_count} -> {len(comments)} comentarios")
-
+    cached_version = cached.get("schema_version", cached.get("version", "0"))
     safe_print(f"[W{worker_id}] Cache validado: version={cached_version}, is_complete={is_complete}, {len(comments)} comentarios, cursor={cursor}")
 
     # Return structured data with validated values
     return {
-        "version": cached_version,
+        "version": str(cached.get("schema_version", cached_version)),
+        "platform": "tiktok",
         "video_id": video_id,
-        "worker_id": worker_id,
-        "timestamp": cached.get("timestamp", datetime.now().isoformat()),
+        "worker_id": cached.get("worker_id", worker_id),
+        "timestamp": cached.get("timestamp_utc", cached.get("timestamp", datetime.now(timezone.utc).isoformat())),
         "batch_number": batch_number,
         "cursor": cursor,
         "total_comments": len(comments),
         "is_complete": is_complete,
+        "completion_state": cached.get("completion_state", "COMPLETE" if is_complete else "IN_PROGRESS"),
+        "successful_pages": cached.get("successful_pages", batch_number),
+        "stop_reason": cached.get("stop_reason"),
+        "run_id": cached.get("run_id"),
         "seen_cids": list(seen_cids),
         "comments": comments,
     }
 
 
 def save_cache(worker_id: int, video_id: str, comments: list, seen_cids: set, batch_number: int, cursor: int, is_final: bool = False):
-    """Guardar cache para resume work.
-
-    Validates data before saving and ensures that is_complete is only True
-    when the scrape is truly complete.
-    """
-    # Validate inputs before saving
-    if not isinstance(comments, list):
-        safe_print(f"[W{worker_id}] Error: comments no es una lista, guardando vacío")
-        comments = []
-
-    # Validate and sanitize seen_cids
-    valid_seen_cids = set()
-    for cid in seen_cids:
-        if isinstance(cid, str) and cid.strip():
-            valid_seen_cids.add(cid)
-
-    # Validate cursor
-    try:
-        cursor = int(cursor)
-    except (ValueError, TypeError):
-        cursor = 0
-
-    # Validate batch_number
-    try:
-        batch_number = int(batch_number)
-    except (ValueError, TypeError):
-        batch_number = 0
-
-    # is_final should only be True if the scrape actually completed naturally
-    # or reached a definitive end point. Never mark incomplete scrapes as completed.
-    # The caller must ensure this invariant.
-
-    cache_file = CACHE_DIR / f"worker_{worker_id}_{video_id}.json"
-    cache_data = {
-        "version": CACHE_VERSION,
-        "video_id": video_id,
-        "worker_id": worker_id,
-        "timestamp": datetime.now().isoformat(),
-        "batch_number": batch_number,
-        "cursor": cursor,
-        "total_comments": len(comments),
-        "is_complete": is_final,
-        "seen_cids": list(valid_seen_cids),
-        "comments": comments,
-    }
-
-    # Atomic write: write to temp file then rename
-    try:
-        temp_file = CACHE_DIR / f"worker_{worker_id}_{video_id}.json.tmp"
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(cache_data, f, ensure_ascii=False)
-        temp_file.rename(cache_file)
-        if not is_final:
-            safe_print(f"      [W{worker_id}][CACHE] Guardado: {len(comments)} comentarios (batch {batch_number})")
-    except Exception as e:
-        safe_print(f"[W{worker_id}] Error guardando cache: {e}")
-
+    """Compatibility wrapper for the single versioned checkpoint writer."""
+    saved_path, save_error = save_and_load_cache_safe(
+        cache_dir=CACHE_DIR, worker_id=worker_id, video_id=video_id,
+        comments=comments, seen_cids=seen_cids, batch_number=batch_number,
+        cursor=cursor, is_final=is_final,
+        completion_state="COMPLETE" if is_final else "IN_PROGRESS",
+    )
+    if save_error:
+        raise RuntimeError(f"Checkpoint persistence failed: {save_error}")
+    return saved_path
 
 
 def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> dict:
-    """Scrape one video through the shared bounded pagination state machine."""
+    """Serialize ownership of a video's checkpoint across threads and processes."""
+    try:
+        with video_checkpoint_lock(CACHE_DIR, str(video_id), timeout=30.0):
+            return _scrape_video_comments_locked(video_id, video_author, worker_id)
+    except TimeoutError as lock_error:
+        return {
+            "video_id": str(video_id), "author": video_author, "worker_id": worker_id,
+            "total_comments": 0, "total_batches": 0, "tokens_used": 0,
+            "proxy_rotations": 0, "duplicates_skipped": 0, "invalid_missing_ids": 0,
+            "status": "partial", "stop_reason": "video_checkpoint_lock_unavailable",
+            "cache_errors": [str(lock_error)], "pagination_outcome": "LOCKED",
+            "pagination_metrics": {}, "recovery_budget": {},
+            "malformed_comments": [], "malformed_comments_path": None, "comments": [],
+        }
+
+
+def _scrape_video_comments_locked(video_id: str, video_author: str, worker_id: int) -> dict:
+    """Scrape one video while holding its cross-process checkpoint lease."""
     from http_transport import HTTPTransport
     from config import (
         PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS, PROXY_REQUIRED, PROXY_MODE,
@@ -402,6 +315,21 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
     token_manager = TokenManager(worker_id, transport=transport, retry_budget=recovery_budget)
 
     cached = load_cache(worker_id, video_id)
+    if cached and cached.get("is_complete", False):
+        # A completed checkpoint is immutable. Do not silently start over and
+        # replace its durable data when the same video appears in a later run.
+        return {
+            "video_id": video_id, "author": video_author, "worker_id": worker_id,
+            "total_comments": len(cached.get("comments", [])),
+            "total_batches": int(cached.get("batch_number", 0)),
+            "tokens_used": 0, "proxy_rotations": 0, "duplicates_skipped": 0,
+            "invalid_missing_ids": 0, "status": "completed",
+            "stop_reason": "existing_completed_checkpoint",
+            "cache_errors": [], "pagination_outcome": "COMPLETE",
+            "pagination_metrics": {}, "recovery_budget": recovery_budget.snapshot(),
+            "malformed_comments": [], "malformed_comments_path": None,
+            "comments": list(cached.get("comments", [])),
+        }
     if cached and not cached.get("is_complete", False):
         all_comments = list(cached.get("comments", []))
         seen_cids = set(cached.get("seen_cids", []))
@@ -488,16 +416,16 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
 
     def persist_batch(batch_info):
         nonlocal last_checkpoint_cursor, last_checkpoint_batch
-        last_checkpoint_cursor = batch_info["checkpoint_cursor"]
-        last_checkpoint_batch = base_batch_number + batch_info["batch_number"]
+        candidate_cursor = batch_info["checkpoint_cursor"]
+        candidate_batch = base_batch_number + batch_info["batch_number"]
         _, save_error = save_and_load_cache_safe(
             cache_dir=CACHE_DIR,
             worker_id=worker_id,
             video_id=video_id,
             comments=all_comments,
             seen_cids=seen_cids,
-            batch_number=last_checkpoint_batch,
-            cursor=last_checkpoint_cursor,
+            batch_number=candidate_batch,
+            cursor=candidate_cursor,
             is_final=False,
         )
         if save_error:
@@ -507,6 +435,10 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
                 f"to preserve the last durable checkpoint: {save_error}"
             )
             raise RuntimeError("Checkpoint persistence failed; current page must not advance")
+        # Advance the in-memory durable position only after the atomic write
+        # has returned successfully.
+        last_checkpoint_cursor = candidate_cursor
+        last_checkpoint_batch = candidate_batch
 
     safe_print(f"\n [W{worker_id}] INICIANDO: {video_id} (@{video_author})")
     safe_print(f" [W{worker_id}] {'─' * 55}")
@@ -533,11 +465,8 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
         naturally_completed = pagination_result.outcome == PaginatorOutcome.COMPLETED
         stop_reason = pagination_result.metadata.stop_reason or pagination_result.outcome.name.lower()
         total_batches = base_batch_number + pagination_result.metadata.batch_number
-        last_checkpoint_cursor = (
-            last_checkpoint_cursor
-            if pagination_result.metadata.stop_reason == "max_comments_reached"
-            else pagination_result.metadata.returned_cursor
-        )
+        # The checkpoint callback owns the durable cursor. Never copy the
+        # paginator's in-memory cursor here: the last page may not have saved.
     else:
         naturally_completed = False
         stop_reason = (
@@ -554,7 +483,7 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
         video_id=video_id,
         comments=all_comments,
         seen_cids=seen_cids,
-        batch_number=total_batches,
+        batch_number=last_checkpoint_batch,
         cursor=last_checkpoint_cursor,
         is_final=naturally_completed,
     )
