@@ -92,9 +92,12 @@ class HTTPTransport:
             url, method=method, headers=headers or {}, data=body
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                status_code = response.getcode()
-                raw_body = response.read()
+            response = urllib.request.urlopen(request, timeout=timeout)
+            status_code = response.getcode()
+            raw_body = response.read()
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
         except urllib.error.HTTPError as error:
             logger.warning("HTTP request failed with status %s", error.code)
             return int(error.code), None
