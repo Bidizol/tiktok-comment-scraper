@@ -88,6 +88,24 @@ def _classify_exception(error: BaseException, proxy_enabled: bool):
     if isinstance(error, OSError): return ("PROXY_ERROR" if proxy_enabled else "NETWORK_ERROR"), True
     return "UNEXPECTED_INTERNAL_ERROR", False
 
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Permit only same-origin redirects; never forward query credentials cross-host."""
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        old = urllib.parse.urlsplit(request.full_url)
+        new = urllib.parse.urlsplit(new_url)
+        old_port = old.port or (443 if old.scheme == "https" else 80)
+        new_port = new.port or (443 if new.scheme == "https" else 80)
+        same_origin = (
+            old.hostname == new.hostname
+            and old_port == new_port
+            and new.scheme == "https" if old.scheme == "https"
+            else old.hostname == new.hostname and old_port == new_port and new.scheme == old.scheme
+        )
+        if not same_origin:
+            return None
+        return super().redirect_request(request, fp, code, message, headers, new_url)
+
+
 class _TimeoutHTTPConnection(http.client.HTTPConnection):
     def __init__(self, host, connect_timeout, read_timeout, **kwargs):
         super().__init__(host, timeout=connect_timeout); self._read_timeout=read_timeout
@@ -170,7 +188,7 @@ class HTTPTransport:
         request=urllib.request.Request(url,data=body,headers=clean,method=method)
         proxy_map={"http":self.proxy_url,"https":self.proxy_url} if self.proxy_url else {}
         opener=urllib.request.build_opener(urllib.request.ProxyHandler(proxy_map),
-            _TimeoutHTTPHandler(connect,read),_TimeoutHTTPSHandler(connect,read))
+            _SafeRedirectHandler(),_TimeoutHTTPHandler(connect,read),_TimeoutHTTPSHandler(connect,read))
         started=time.monotonic(); response=None
         try:
             try: response=opener.open(request,timeout=connect)
