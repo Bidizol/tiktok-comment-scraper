@@ -229,6 +229,7 @@ class CommentPaginator:
                 if not isinstance(comments, list):
                     return self._schema_failure("malformed_comments", "Comment API comments field must be a list")
                 next_cursor = batch.get("next_cursor")
+                api_returned_cursor = next_cursor
                 reported_total = batch.get("reported_total")
                 page_size = batch.get("page_size", 50)
                 if (reported_total is not None and
@@ -430,11 +431,12 @@ class CommentPaginator:
 
                 logger.info(
                     "Pagination page received: video_id=%s batch=%d requested_cursor=%s "
-                    "returned_cursor=%s has_more=%s records=%d accepted=%d duplicates=%d "
-                    "consecutive_no_new=%d reported_total=%s continue_after_page=%s",
-                    self.video_id, self.metadata.batch_number, cursor, next_cursor,
-                    has_more, records_received, accepted, duplicate_count, consecutive_no_new,
-                    reported_total, continue_pagination,
+                    "api_returned_cursor=%s next_cursor=%s has_more=%s records=%d "
+                    "accepted=%d duplicates=%d consecutive_no_new=%d reported_total=%s "
+                    "continue_after_page=%s",
+                    self.video_id, self.metadata.batch_number, cursor, api_returned_cursor,
+                    next_cursor, has_more, records_received, accepted, duplicate_count,
+                    consecutive_no_new, reported_total, continue_pagination,
                 )
 
                 checkpoint_cursor = cursor if page_truncated else next_cursor
