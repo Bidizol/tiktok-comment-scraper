@@ -21,6 +21,7 @@ from token_manager import TokenManager, MAX_REFRESH_ATTEMPTS
 from proxy_manager import ProxyManager
 from retry import BoundedRetry, RetryPolicy, RetryRecord
 from coordinated_retry import CoordinatedRetryBudget, ErrorClassifier, AttemptRecord, make_classifier_for_operation, CoordinatedRetryContext
+from recovery_budget import RecoveryBudget
 from diagnostics import DiagnosticsRecorder
 
 from errors.model import ScraperError, ErrorSeverity, ErrorOutcome
@@ -391,7 +392,14 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
         max_response_bytes=HTTP_MAX_RESPONSE_BYTES,
         max_retries=HTTP_MAX_RETRIES,
     )
-    token_manager = TokenManager(worker_id, transport=transport)
+    run_id = str(uuid.uuid4())
+    recovery_budget = RecoveryBudget(
+        video_id=str(video_id), run_id=run_id, worker_id=worker_id,
+        maximum_retries=12, maximum_elapsed_seconds=DEFAULT_ELAPSED_TIMEOUT_SECONDS,
+        maximum_consecutive_failures=6, maximum_token_refresh_retries=6,
+        maximum_proxy_retries=2,
+    )
+    token_manager = TokenManager(worker_id, transport=transport, retry_budget=recovery_budget)
 
     cached = load_cache(worker_id, video_id)
     if cached and not cached.get("is_complete", False):
@@ -495,9 +503,10 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
         if save_error:
             cache_errors.append(str(save_error))
             safe_print(
-                f"      [W{worker_id}][CACHE] Save error "
-                f"(data retained in memory): {save_error}"
+                f"      [W{worker_id}][CACHE] Save error; stopping this video "
+                f"to preserve the last durable checkpoint: {save_error}"
             )
+            raise RuntimeError("Checkpoint persistence failed; current page must not advance")
 
     safe_print(f"\n [W{worker_id}] INICIANDO: {video_id} (@{video_author})")
     safe_print(f" [W{worker_id}] {'─' * 55}")
@@ -507,11 +516,12 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
     if remaining_comments > 0 and base_batch_number < DEFAULT_MAX_BATCHES:
         paginator = CommentPaginator(
             video_id=video_id,
-            run_id=str(uuid.uuid4()),
+            run_id=run_id,
             worker_id=worker_id,
             max_batches=DEFAULT_MAX_BATCHES - base_batch_number,
             max_comments=remaining_comments,
             transport=transport,
+            retry_budget=recovery_budget,
         )
         pagination_result = paginator.run(
             initial_cursor=cursor,
@@ -550,6 +560,8 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
     )
     if save_error:
         cache_errors.append(str(save_error))
+        naturally_completed = False
+        stop_reason = "final_checkpoint_save_failed"
         safe_print(f"      [W{worker_id}][CACHE] Final save error: {save_error}")
 
     result = {
@@ -567,6 +579,7 @@ def scrape_video_comments(video_id: str, video_author: str, worker_id: int) -> d
         "cache_errors": cache_errors,
         "pagination_outcome": pagination_result.outcome.name if pagination_result else "NOT_STARTED",
         "pagination_metrics": pagination_result.metadata.to_dict() if pagination_result else {},
+        "recovery_budget": recovery_budget.snapshot(),
         "malformed_comments": pagination_result.malformed_comments if pagination_result else [],
         "malformed_comments_path": str(malformed_path) if pagination_result and pagination_result.metadata.malformed_rejected and malformed_path.exists() else None,
         "comments": all_comments,

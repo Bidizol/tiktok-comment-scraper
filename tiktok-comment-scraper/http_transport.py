@@ -250,7 +250,8 @@ class HTTPTransport:
         return HTTPResponse(status,response_headers,raw,parsed_json,datetime.now(timezone.utc).isoformat())
 
     def request_with_retry(self, method, url, *, headers=None, body=None, expect_json=True,
-                           maximum_attempts=None, max_backoff_seconds=300.0):
+                           maximum_attempts=None, max_backoff_seconds=300.0,
+                           retry_budget=None, retry_component="http"):
         if method.upper() not in {"GET","HEAD"} or body is not None:
             raise ValueError("Automatic retries are restricted to idempotent GET/HEAD requests")
         maximum_attempts = self.max_retries if maximum_attempts is None else maximum_attempts
@@ -261,14 +262,26 @@ class HTTPTransport:
         last=None
         for attempt in range(1,maximum_attempts+1):
             try:
-                return self.request_detailed(method,url,headers=headers,body=body,expect_json=expect_json)
+                result = self.request_detailed(method,url,headers=headers,body=body,expect_json=expect_json)
+                if retry_budget is not None:
+                    retry_budget.record_success(retry_component)
+                return result
             except HTTPTransportError as error:
                 last=error
-                if not error.retryable or attempt==maximum_attempts: raise
+                if not error.retryable or attempt==maximum_attempts:
+                    if retry_budget is not None and retry_component != "token":
+                        retry_budget.record_failure(retry_component, error.error_code)
+                    raise
+                if retry_budget is not None and not retry_budget.consume_retry(retry_component, error.error_code):
+                    raise HTTPTransportError("RETRY_EXHAUSTED","Shared per-video recovery budget prevented another HTTP retry",
+                                              retryable=False,http_status=error.http_status) from error
                 ceiling=min(max_backoff_seconds,2.0**(attempt-1))
                 delay=min(error.retry_after_seconds,max_backoff_seconds) if error.retry_after_seconds is not None else random.uniform(0.0,ceiling)
+                if retry_budget is not None:
+                    delay = min(delay, retry_budget.remaining_seconds())
                 logger.warning("HTTP retry scheduled: attempt=%d/%d code=%s",attempt+1,maximum_attempts,error.error_code)
-                time.sleep(delay)
+                if delay > 0:
+                    time.sleep(delay)
         raise last
 
     def request(self,method,url,headers=None,body=None,connect_timeout=None,read_timeout=None,overall_timeout=None):

@@ -75,7 +75,7 @@ class CommentPaginator:
         max_consecutive_empty: int = DEFAULT_MAX_CONSECUTIVE_EMPTY,
         stalled_timeout_seconds: int = DEFAULT_STALLED_TIMEOUT_SECONDS,
         elapsed_timeout_seconds: int = DEFAULT_ELAPSED_TIMEOUT_SECONDS,
-        transport: Optional[HTTPTransport] = None,
+        transport: Optional[HTTPTransport] = None, retry_budget: Any = None,
     ):
         limits = {
             "max_batches": max_batches, "max_comments": max_comments,
@@ -104,6 +104,7 @@ class CommentPaginator:
         self.stalled_timeout_seconds = float(stalled_timeout_seconds)
         self.elapsed_timeout_seconds = float(elapsed_timeout_seconds)
         self.transport = transport or HTTPTransport()
+        self.retry_budget = retry_budget
         self.cursor_checker = CursorIntegrityChecker(
             max_cycle_detections=max(5000, self.max_batches + 1),
             max_consecutive_empty=self.max_consecutive_empty,
@@ -158,6 +159,12 @@ class CommentPaginator:
 
         try:
             while True:
+                if self.retry_budget is not None and not self.retry_budget.check_deadline():
+                    reason = self.retry_budget.snapshot().get("exhausted_reason") or "recovery_budget_exhausted"
+                    return self._finish(
+                        PaginatorOutcome.FAILED_RESUMABLE, PaginationState.FAILED_RESUMABLE, reason,
+                        self._error("RETRY_EXHAUSTED", "Per-video recovery budget exhausted", ErrorOutcome.RETRY_EXHAUSTED),
+                    )
                 if time.monotonic() - started >= self.elapsed_timeout_seconds:
                     return self._finish(PaginatorOutcome.TRUNCATED_LIMIT, PaginationState.TRUNCATED_LIMIT, "elapsed_timeout")
                 if self.metadata.batch_number >= self.max_batches:
@@ -169,10 +176,12 @@ class CommentPaginator:
                 try:
                     current_token = mstoken() if callable(mstoken) else mstoken
                 except Exception as token_error:
+                    token_code = getattr(token_error, "error_code", "TOKEN_REFRESH_ERROR")
+                    token_outcome = ErrorOutcome.RETRY_EXHAUSTED if token_code == "RETRY_EXHAUSTED" else ErrorOutcome.FAILED_RESUMABLE
                     return self._finish(
                         PaginatorOutcome.FAILED_RESUMABLE, PaginationState.FAILED_RESUMABLE,
-                        "token_refresh_failed",
-                        self._error("TOKEN_REFRESH_ERROR", type(token_error).__name__, ErrorOutcome.FAILED_RESUMABLE),
+                        "token_refresh_failed:" + token_code,
+                        self._error(token_code, type(token_error).__name__, outcome=token_outcome),
                     )
                 if (not isinstance(current_token, str) or not current_token or len(current_token) > 4096
                         or any(character in current_token for character in "\r\n")):
@@ -434,6 +443,8 @@ class CommentPaginator:
         try:
             response = self.transport.request_with_retry(
                 "GET", url,
+                retry_budget=self.retry_budget,
+                retry_component=("proxy" if self.transport.proxy_url else "http"),
                 headers={
                     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     "referer": "https://www.tiktok.com/",
@@ -442,7 +453,9 @@ class CommentPaginator:
                 maximum_attempts=self.transport.max_retries,
             )
         except HTTPTransportError as transport_error:
-            outcome = ErrorOutcome.FAILED_RESUMABLE if transport_error.retryable else ErrorOutcome.FAILED_PERMANENT
+            outcome = (ErrorOutcome.RETRY_EXHAUSTED if transport_error.error_code == "RETRY_EXHAUSTED"
+                       else ErrorOutcome.FAILED_RESUMABLE if transport_error.retryable
+                       else ErrorOutcome.FAILED_PERMANENT)
             raise self._error(
                 transport_error.error_code, str(transport_error),
                 http_status=transport_error.http_status, outcome=outcome,
@@ -505,13 +518,14 @@ def paginate_comments(
     initial_cursor: int = 0, on_comment: Optional[Callable[[dict], Any]] = None,
     on_batch: Optional[Callable[[dict], Any]] = None,
     on_malformed_comment: Optional[Callable[[Any, str], Any]] = None,
-    transport: Optional[HTTPTransport] = None,
+    transport: Optional[HTTPTransport] = None, retry_budget: Any = None,
 ) -> PaginatorResult:
     paginator = CommentPaginator(
         video_id=video_id, run_id=run_id, max_batches=max_batches,
         max_comments=max_comments, max_consecutive_empty=max_consecutive_empty,
         stalled_timeout_seconds=stalled_timeout_seconds,
         elapsed_timeout_seconds=elapsed_timeout_seconds, transport=transport,
+        retry_budget=retry_budget,
     )
     return paginator.run(
         initial_cursor=initial_cursor, mstoken=mstoken,
