@@ -315,7 +315,8 @@ def scrape_videos_and_export(video_jobs: list, max_workers: int = 3, run_id: str
         }
 
     health = monitor.snapshot()
-    if health.get("disk_free_bytes") is not None and health["disk_free_bytes"] < MINIMUM_FREE_BYTES:
+    low_disk_alerted = health.get("disk_free_bytes") is not None and health["disk_free_bytes"] < MINIMUM_FREE_BYTES
+    if low_disk_alerted:
         monitor.alert(
             "LOW_DISK_SPACE", "ERROR",
             "Available disk space is below the configured minimum threshold.",
@@ -331,76 +332,80 @@ def scrape_videos_and_export(video_jobs: list, max_workers: int = 3, run_id: str
         disk_usage_percent=health.get("disk_usage_percent"),
     )
 
-    with scraper_run_lock(CACHE_DIR, timeout=0.0):
-        monitor.record_event("run_lock_acquired", component="run_coordinator")
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="tiktok-video") as executor:
-            pending = {}
-
-            def submit_until_bounded():
-                nonlocal next_index
-                while (not run_control.is_stopped()
-                       and next_index < len(normalized_jobs)
-                       and len(pending) < max_pending):
-                    index = next_index
-                    next_index += 1
-                    video_id, author = normalized_jobs[index]
-                    monitor.record_event(
-                        "video_queued", component="run_coordinator",
-                        video_id=video_id, worker_id=index + 1,
-                    )
-                    future = executor.submit(
-                        scrape_video_comments, video_id, author, index + 1,
-                        run_id, run_control, monitor,
-                    )
-                    pending[future] = index
-
-            submit_until_bounded()
-            while pending:
-                completed, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
-                for future in completed:
-                    index = pending.pop(future)
-                    if future.cancelled():
-                        results_by_index[index] = interrupted_result(index, "run_stopped_before_worker_start")
-                        continue
-                    try:
-                        results_by_index[index] = future.result()
-                    except Exception as error:
+    try:
+        with scraper_run_lock(CACHE_DIR, timeout=0.0):
+            monitor.record_event("run_lock_acquired", component="run_coordinator")
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="tiktok-video") as executor:
+                pending = {}
+    
+                def submit_until_bounded():
+                    nonlocal next_index
+                    while (not run_control.is_stopped()
+                           and next_index < len(normalized_jobs)
+                           and len(pending) < max_pending):
+                        index = next_index
+                        next_index += 1
                         video_id, author = normalized_jobs[index]
-                        recovered_comments = []
-                        recovery_error = None
-                        try:
-                            recovered_cache = load_cache(index + 1, video_id)
-                            if recovered_cache:
-                                recovered_comments = [
-                                    normalize_comment_record(video_id, item)
-                                    for item in recovered_cache.get("comments", [])
-                                ]
-                        except Exception as cache_error:
-                            recovery_error = type(cache_error).__name__
-                        results_by_index[index] = {
-                            "video_id": video_id, "author": author, "worker_id": index + 1,
-                            "run_id": run_id, "total_comments": len(recovered_comments), "total_batches": 0,
-                            "status": "failed", "stop_reason": "unhandled_video_worker_exception",
-                            "error_code": getattr(error, "error_code", "UNEXPECTED_INTERNAL_ERROR"),
-                            "error_type": type(error).__name__, "cache_recovery_error": recovery_error,
-                            "comments": recovered_comments,
-                        }
                         monitor.record_event(
-                            "worker_result_recovered", severity="ERROR", component="run_coordinator",
-                            video_id=video_id, worker_id=index + 1, status="failed",
-                            stop_reason="unhandled_video_worker_exception",
-                            error_code=getattr(error, "error_code", "UNEXPECTED_INTERNAL_ERROR"),
-                            error_type=type(error).__name__,
-                            cache_error_count=1 if recovery_error else 0,
+                            "video_queued", component="run_coordinator",
+                            video_id=video_id, worker_id=index + 1,
                         )
-
-                if run_control.is_stopped():
-                    for future, index in list(pending.items()):
-                        if future.cancel():
-                            pending.pop(future)
+                        future = executor.submit(
+                            scrape_video_comments, video_id, author, index + 1,
+                            run_id, run_control, monitor,
+                        )
+                        pending[future] = index
+    
+                submit_until_bounded()
+                while pending:
+                    completed, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        index = pending.pop(future)
+                        if future.cancelled():
                             results_by_index[index] = interrupted_result(index, "run_stopped_before_worker_start")
-                else:
-                    submit_until_bounded()
+                            continue
+                        try:
+                            results_by_index[index] = future.result()
+                        except Exception as error:
+                            video_id, author = normalized_jobs[index]
+                            recovered_comments = []
+                            recovery_error = None
+                            try:
+                                recovered_cache = load_cache(index + 1, video_id)
+                                if recovered_cache:
+                                    recovered_comments = [
+                                        normalize_comment_record(video_id, item)
+                                        for item in recovered_cache.get("comments", [])
+                                    ]
+                            except Exception as cache_error:
+                                recovery_error = type(cache_error).__name__
+                            results_by_index[index] = {
+                                "video_id": video_id, "author": author, "worker_id": index + 1,
+                                "run_id": run_id, "total_comments": len(recovered_comments), "total_batches": 0,
+                                "status": "failed", "stop_reason": "unhandled_video_worker_exception",
+                                "error_code": getattr(error, "error_code", "UNEXPECTED_INTERNAL_ERROR"),
+                                "error_type": type(error).__name__, "cache_recovery_error": recovery_error,
+                                "comments": recovered_comments,
+                            }
+                            monitor.record_event(
+                                "worker_result_recovered", severity="ERROR", component="run_coordinator",
+                                video_id=video_id, worker_id=index + 1, status="failed",
+                                stop_reason="unhandled_video_worker_exception",
+                                error_code=getattr(error, "error_code", "UNEXPECTED_INTERNAL_ERROR"),
+                                error_type=type(error).__name__,
+                                cache_error_count=1 if recovery_error else 0,
+                            )
+    
+                    if run_control.is_stopped():
+                        for future, index in list(pending.items()):
+                            if future.cancel():
+                                pending.pop(future)
+                                results_by_index[index] = interrupted_result(index, "run_stopped_before_worker_start")
+                    else:
+                        submit_until_bounded()
+    except RuntimeError as error:
+        monitor.record_error("run_coordinator", "scraper_run_lock_or_executor", error)
+        raise
 
     for index in range(next_index, len(normalized_jobs)):
         results_by_index[index] = interrupted_result(index, "run_stopped_before_worker_start")
@@ -440,6 +445,16 @@ def scrape_videos_and_export(video_jobs: list, max_workers: int = 3, run_id: str
             partial_videos=partial_count, failed_videos=failed_count,
         )
 
+    final_health = monitor.snapshot()
+    final_disk_free = final_health.get("disk_free_bytes")
+    if (not low_disk_alerted and final_disk_free is not None
+            and final_disk_free < MINIMUM_FREE_BYTES):
+        monitor.alert(
+            "LOW_DISK_SPACE", "ERROR",
+            "Available disk space fell below the configured minimum during this run.",
+            disk_free_bytes=final_disk_free,
+            disk_total_bytes=final_health.get("disk_total_bytes"),
+        )
     monitor_snapshot = monitor.snapshot()
     try:
         outputs = export_run_results(
