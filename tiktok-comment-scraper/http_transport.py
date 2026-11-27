@@ -11,6 +11,7 @@ import json
 import logging
 import socket
 import ssl
+import http.client
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -40,6 +41,73 @@ except ImportError:
     ErrorOutcome = None
 
 logger = logging.getLogger(__name__)
+
+class _TimeoutHTTPConnection(http.client.HTTPConnection):
+    """HTTP connection with distinct connect and socket-read timeouts."""
+
+    def __init__(self, host, connect_timeout, read_timeout, **kwargs):
+        super().__init__(host, timeout=connect_timeout)
+        self._read_timeout = read_timeout
+
+    def connect(self):
+        super().connect()
+        if self.sock is not None:
+            self.sock.settimeout(self._read_timeout)
+
+
+class _TimeoutHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection with distinct connect and socket-read timeouts."""
+
+    def __init__(self, host, connect_timeout, read_timeout, context=None, check_hostname=None, **kwargs):
+        super().__init__(
+            host,
+            timeout=connect_timeout,
+            context=context,
+            check_hostname=check_hostname,
+        )
+        self._read_timeout = read_timeout
+
+    def connect(self):
+        super().connect()
+        if self.sock is not None:
+            self.sock.settimeout(self._read_timeout)
+
+
+class _TimeoutHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, connect_timeout, read_timeout):
+        super().__init__()
+        self.connect_timeout = connect_timeout
+        self.read_timeout = read_timeout
+
+    def http_open(self, request):
+        return self.do_open(
+            lambda host, **kwargs: _TimeoutHTTPConnection(
+                host, self.connect_timeout, self.read_timeout
+            ),
+            request,
+        )
+
+
+class _TimeoutHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, connect_timeout, read_timeout):
+        super().__init__()
+        self.connect_timeout = connect_timeout
+        self.read_timeout = read_timeout
+
+    def https_open(self, request):
+        return self.do_open(
+            lambda host, **kwargs: _TimeoutHTTPSConnection(
+                host,
+                self.connect_timeout,
+                self.read_timeout,
+                context=self._context,
+                check_hostname=self._check_hostname,
+            ),
+            request,
+            context=self._context,
+            check_hostname=self._check_hostname,
+        )
+
 
 #: Default connection timeout in seconds
 DEFAULT_CONNECT_TIMEOUT = 15
@@ -73,11 +141,6 @@ class HTTPTransport:
         # The URL is retained only for constructing the opener; it is never logged.
         self.proxy_url = proxy_url
         self.last_response_headers = None
-        self._opener = None
-        if proxy_url:
-            self._opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-            )
 
     def request(
         self,
@@ -97,15 +160,26 @@ class HTTPTransport:
         HTTP, network, and malformed-JSON failures return a status and None.
         """
         timeout = overall_timeout if overall_timeout is not None else self.overall_timeout
+        connect_limit = connect_timeout if connect_timeout is not None else self.connect_timeout
+        read_limit = read_timeout if read_timeout is not None else self.read_timeout
+        if timeout is not None:
+            connect_limit = min(connect_limit, timeout)
+            read_limit = min(read_limit, timeout)
         request = urllib.request.Request(
             url, method=method, headers=headers or {}, data=body
         )
+        proxy_map = (
+            {"http": self.proxy_url, "https": self.proxy_url}
+            if self.proxy_url
+            else None
+        )
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler(proxy_map),
+            _TimeoutHTTPHandler(connect_limit, read_limit),
+            _TimeoutHTTPSHandler(connect_limit, read_limit),
+        )
         try:
-            opener = self._opener
-            if opener is None:
-                response_context = urllib.request.urlopen(request, timeout=timeout)
-            else:
-                response_context = opener.open(request, timeout=timeout)
+            response_context = opener.open(request, timeout=timeout)
             with response_context as response:
                 status_code = response.getcode()
                 self.last_response_headers = response.headers
